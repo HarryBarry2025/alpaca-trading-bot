@@ -23,7 +23,11 @@ api = REST(API_KEY, API_SECRET, BASE_URL)
 def get_data(symbol, timeframe, lookback):
     start = (dt.datetime.now() - dt.timedelta(hours=lookback + 5)).replace(microsecond=0).isoformat() + 'Z'
     bars = api.get_bars(symbol, timeframe, start=start).df
-    return bars[bars['symbol'] == symbol].copy()
+    # Manche Alpaca-Versionen liefern keine 'symbol'-Spalte zurück, wenn nur 1 Symbol abgefragt wird
+    if 'symbol' in bars.columns:
+        return bars[bars['symbol'] == symbol].copy()
+    else:
+        return bars.copy()
 
 def elder_not_red(df):
     ema = EMAIndicator(df['close'], window=13).ema_indicator()
