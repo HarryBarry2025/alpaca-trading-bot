@@ -1,7 +1,0 @@
-txt
-
-alpaca-trade-api
-ta
-pandas
-numpy
-requests
