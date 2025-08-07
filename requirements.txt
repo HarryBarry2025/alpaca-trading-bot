@@ -5,3 +5,4 @@ ta
 pandas
 numpy
 requests
+yfinance
