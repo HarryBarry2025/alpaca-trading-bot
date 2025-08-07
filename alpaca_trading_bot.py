@@ -16,7 +16,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SYMBOL = "TQQQ"
 VIX_SYMBOL = "VIXY"
 TIMEFRAME = TimeFrame.Hour
-TIMEFRAME_5MIN = TimeFrame(5, TimeFrame.Unit.Minute)
+TIMEFRAME_5MIN = TimeFrame(5, TimeFrame.Minute)
 LOOKBACK = 100
 
 api = REST(API_KEY, API_SECRET, BASE_URL)
@@ -24,7 +24,6 @@ api = REST(API_KEY, API_SECRET, BASE_URL)
 def get_data(symbol, timeframe, lookback):
     start = (dt.datetime.now() - dt.timedelta(hours=lookback + 5)).replace(microsecond=0).isoformat() + 'Z'
     bars = api.get_bars(symbol, timeframe, start=start).df
-    # Manche Alpaca-Versionen liefern keine 'symbol'-Spalte zurück, wenn nur 1 Symbol abgefragt wird
     if 'symbol' in bars.columns:
         return bars[bars['symbol'] == symbol].copy()
     else:
@@ -85,7 +84,7 @@ def check_signals():
         send_telegram(f"🔻 SELL {SYMBOL} at {latest['close']:.2f}")
     else:
         print("⏳ No action")
-        send_telegram(f"🔻 Test {SYMBOL} at {latest['close']:.2f}")
+        send_telegram(f"🔻 SELL {SYMBOL} at {latest['close']:.2f}")
 
 if __name__ == "__main__":
     check_signals()
