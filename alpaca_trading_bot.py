@@ -1,4 +1,3 @@
-
 import pandas as pd
 import numpy as np
 from ta.momentum import RSIIndicator
@@ -67,8 +66,8 @@ def backtest(params, timeframe):
             entry = (
                 latest['macd'] > latest['signal'] and
                 rsi_entry_min < latest['rsi'] < rsi_entry_max and
-                bool(latest['rsi_rising']) and
-                bool(latest['impulse_ok']) and
+                latest['rsi_rising'] is True and
+                latest['impulse_ok'] is True and
                 vix_ok
             )
         except Exception:
@@ -94,7 +93,7 @@ def optimize():
     best_result = -np.inf
     best_params = None
     results = []
-    timeframes = ["15m", "30m", "1h", "4h"]  # Replaced "2h" with "4h"
+    timeframes = ["15m", "30m", "1h", "4h"]  # Updated intervals
 
     rsi_lens = [10, 12, 14]
     rsi_entries = [(50, 65), (52, 64), (54, 62)]
@@ -144,7 +143,7 @@ def optimize():
 
     # Heatmap: Timeframe vs MACD Fast
     pivot = df_results.pivot_table(index="timeframe", columns="macd_fast", values="return", aggfunc=np.max)
-    plt.figure(figsize=(10,6))
+    plt.figure(figsize=(10, 6))
     sns.heatmap(pivot, annot=True, fmt=".1f", cmap="coolwarm")
     plt.title("Max Return Heatmap: Timeframe vs MACD Fast")
     plt.xlabel("MACD Fast")
