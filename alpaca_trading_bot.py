@@ -5,7 +5,6 @@ from ta.trend import MACD, EMAIndicator
 import yfinance as yf
 import matplotlib.pyplot as plt
 import seaborn as sns
-import datetime as dt
 from itertools import product
 
 SYMBOL = "TQQQ"
@@ -22,7 +21,7 @@ def get_data_yf(symbol, interval, period):
 def elder_not_red(df, ema_length, macd_fast, macd_slow, macd_signal):
     close_series = df['Close'].squeeze()
     ema = EMAIndicator(close_series, window=ema_length).ema_indicator()
-    macd = MACD(close_series, macd_fast, macd_slow, macd_signal)
+    macd = MACD(close_series, window_fast=macd_fast, window_slow=macd_slow, window_sign=macd_signal)
     hist = macd.macd_diff()
     return (ema > ema.shift(1)) | (hist > hist.shift(1))
 
@@ -34,7 +33,7 @@ def backtest(params, timeframe):
     close_series = df['Close'].squeeze()
 
     df['rsi'] = RSIIndicator(close=close_series, window=rsi_len).rsi()
-    macd = MACD(close=close_series, window_slow=macd_s, window_fast=macd_f, window_sign=macd_sig)
+    macd = MACD(close=close_series, window_fast=macd_f, window_slow=macd_s, window_sign=macd_sig)
     df['macd'] = macd.macd()
     df['signal'] = macd.macd_signal()
     df['hist'] = macd.macd_diff()
@@ -55,13 +54,18 @@ def backtest(params, timeframe):
     for i in range(1, len(df)):
         latest = df.iloc[i]
         vix_ok = not vix.iloc[-1]['vix_rising'] if len(vix) > 1 else True
-        entry = (
-            latest['macd'] > latest['signal'] and
-            rsi_entry_min < latest['rsi'] < rsi_entry_max and
-            latest['rsi_rising'] and
-            latest['impulse_ok'] and
-            vix_ok
-        )
+
+        try:
+            entry = (
+                latest['macd'] > latest['signal'] and
+                rsi_entry_min < latest['rsi'] < rsi_entry_max and
+                bool(latest['rsi_rising']) and
+                bool(latest['impulse_ok']) and
+                vix_ok
+            )
+        except Exception:
+            entry = False
+
         exit = latest['rsi'] < rsi_exit
 
         if entry and not position:
@@ -115,7 +119,7 @@ def optimize():
                     best_params = (rsi_len, entry_min, entry_max, rsi_exit, macd_f, macd_s, macd_sig, ema_len, tf)
                 print(f"TF={tf} Tested RSI={rsi_len}, Entry=({entry_min}-{entry_max}), Exit={rsi_exit}, MACD=({macd_f},{macd_s},{macd_sig}), EMA={ema_len} → Return={result:.2f}%")
             except Exception as e:
-                print(f"Error on TF={tf} with params {rsi_len, entry_min, entry_max, rsi_exit, macd_f, macd_s, macd_sig, ema_len}: {e}")
+                print(f"Error on TF={tf} with params {(rsi_len, entry_min, entry_max, rsi_exit, macd_f, macd_s, macd_sig, ema_len)}: {e}")
 
     if not results:
         print("No valid backtest results.")
@@ -125,12 +129,12 @@ def optimize():
     print(f"Return: {best_result:.2f}%")
     print(f"Params: RSI={best_params[0]}, Entry=({best_params[1]}, {best_params[2]}), Exit={best_params[3]}, MACD=({best_params[4]},{best_params[5]},{best_params[6]}), EMA={best_params[7]}, Timeframe={best_params[8]}")
 
-    # Tabellarische Ausgabe
+    # Tabular results
     df_results = pd.DataFrame(results)
-    print("\nTop 10 Ergebnisse:")
+    print("\nTop 10 Results:")
     print(df_results.sort_values(by="return", ascending=False).head(10))
 
-    # Heatmap Plot (Timeframe vs Return)
+    # Heatmap: Timeframe vs MACD Fast
     pivot = df_results.pivot_table(index="timeframe", columns="macd_fast", values="return", aggfunc=np.max)
     plt.figure(figsize=(10,6))
     sns.heatmap(pivot, annot=True, fmt=".1f", cmap="coolwarm")
@@ -142,3 +146,4 @@ def optimize():
 
 if __name__ == "__main__":
     optimize()
+
