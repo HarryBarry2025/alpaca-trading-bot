@@ -16,6 +16,7 @@ def get_data_yf(symbol, interval, period):
         df = yf.download(symbol, interval=interval, period=period, auto_adjust=False)
         if df.empty:
             print(f"[!] No data for {symbol} with interval={interval}, period={period}")
+        df['Close'] = df['Close'].astype(float).squeeze()
         return df
     except Exception as e:
         print(f"[!] Error fetching data for {symbol}: {e}")
@@ -25,7 +26,7 @@ def elder_not_red(df, ema_length, macd_fast, macd_slow, macd_signal):
     ema = EMAIndicator(close=df['Close'], window=ema_length).ema_indicator()
     macd = MACD(close=df['Close'], window_slow=macd_slow, window_fast=macd_fast, window_sign=macd_signal)
     hist = macd.macd_diff()
-    return (ema > ema.shift(1)) | (hist > hist.shift(1))
+    return ((ema > ema.shift(1)) | (hist > hist.shift(1))).astype(bool)
 
 def backtest(params, timeframe):
     rsi_len, rsi_entry_min, rsi_entry_max, rsi_exit, macd_f, macd_s, macd_sig, ema_len = params
@@ -35,9 +36,6 @@ def backtest(params, timeframe):
     if df.empty or vix.empty or 'Close' not in df.columns or 'Close' not in vix.columns:
         print(f"[!] Skipping due to missing data for TF={timeframe} with params {params}")
         return -9999
-
-    df['Close'] = df['Close'].astype(float)
-    vix['Close'] = vix['Close'].astype(float)
 
     df['rsi'] = RSIIndicator(close=df['Close'], window=rsi_len).rsi()
     macd = MACD(close=df['Close'], window_fast=macd_f, window_slow=macd_s, window_sign=macd_sig)
@@ -145,3 +143,4 @@ def optimize():
 
 if __name__ == "__main__":
     optimize()
+
