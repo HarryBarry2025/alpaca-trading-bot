@@ -84,7 +84,7 @@ def check_signals():
         send_telegram(f"🔻 SELL {SYMBOL} at {latest['close']:.2f}")
     else:
         print("⏳ No action")
-        send_telegram(f"🔻 SELL {SYMBOL} at {latest['close']:.2f}")
+        send_telegram(f" TTTEEESSSTTT  {SYMBOL} at {latest['close']:.2f}")
 
 if __name__ == "__main__":
     check_signals()
