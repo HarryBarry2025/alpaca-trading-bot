@@ -1,3 +1,4 @@
+
 import pandas as pd
 import numpy as np
 from ta.momentum import RSIIndicator
@@ -12,11 +13,15 @@ VIX_SYMBOL = "VIXY"
 LOOKBACK_DAYS = 60
 
 def get_data_yf(symbol, interval, period):
-    df = yf.download(symbol, interval=interval, period=period)
-    if df.empty or 'Close' not in df.columns:
-        raise ValueError(f"No data returned for {symbol} with interval={interval}, period={period}")
-    df.dropna(inplace=True)
-    return df
+    try:
+        df = yf.download(symbol, interval=interval, period=period)
+        if df.empty or 'Close' not in df.columns:
+            raise ValueError(f"No valid data for {symbol} with interval={interval}, period={period}")
+        df.dropna(inplace=True)
+        return df
+    except Exception as e:
+        print(f"[!] Data fetch error for {symbol} ({interval}): {e}")
+        return pd.DataFrame()
 
 def elder_not_red(df, ema_length, macd_fast, macd_slow, macd_signal):
     close_series = df['Close'].squeeze()
@@ -29,6 +34,9 @@ def backtest(params, timeframe):
     rsi_len, rsi_entry_min, rsi_entry_max, rsi_exit, macd_f, macd_s, macd_sig, ema_len = params
     df = get_data_yf(SYMBOL, timeframe, f"{LOOKBACK_DAYS}d")
     vix = get_data_yf(VIX_SYMBOL, "15m", "5d")
+
+    if df.empty or vix.empty:
+        return -np.inf
 
     close_series = df['Close'].squeeze()
 
@@ -86,7 +94,7 @@ def optimize():
     best_result = -np.inf
     best_params = None
     results = []
-    timeframes = ["15m", "30m", "1h", "2h"]
+    timeframes = ["15m", "30m", "1h", "4h"]  # Replaced "2h" with "4h"
 
     rsi_lens = [10, 12, 14]
     rsi_entries = [(50, 65), (52, 64), (54, 62)]
@@ -119,7 +127,7 @@ def optimize():
                     best_params = (rsi_len, entry_min, entry_max, rsi_exit, macd_f, macd_s, macd_sig, ema_len, tf)
                 print(f"TF={tf} Tested RSI={rsi_len}, Entry=({entry_min}-{entry_max}), Exit={rsi_exit}, MACD=({macd_f},{macd_s},{macd_sig}), EMA={ema_len} → Return={result:.2f}%")
             except Exception as e:
-                print(f"Error on TF={tf} with params {(rsi_len, entry_min, entry_max, rsi_exit, macd_f, macd_s, macd_sig, ema_len)}: {e}")
+                print(f"[!] Error on TF={tf} with params {(rsi_len, entry_min, entry_max, rsi_exit, macd_f, macd_s, macd_sig, ema_len)}: {e}")
 
     if not results:
         print("No valid backtest results.")
@@ -146,4 +154,3 @@ def optimize():
 
 if __name__ == "__main__":
     optimize()
-
