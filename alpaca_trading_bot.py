@@ -1,4 +1,3 @@
-
 import pandas as pd
 import numpy as np
 from ta.momentum import RSIIndicator
@@ -6,7 +5,6 @@ from ta.trend import MACD, EMAIndicator
 import yfinance as yf
 import matplotlib.pyplot as plt
 import seaborn as sns
-import datetime as dt
 from itertools import product
 
 SYMBOL = "TQQQ"
@@ -15,17 +13,17 @@ LOOKBACK_DAYS = 60
 
 def get_data_yf(symbol, interval, period):
     try:
-        data = yf.download(symbol, interval=interval, period=period)
-        if 'Close' in data.columns:
-            data['Close'] = data['Close'].squeeze()
-        return data
+        df = yf.download(symbol, interval=interval, period=period, auto_adjust=False)
+        if df.empty:
+            print(f"[!] No data for {symbol} with interval={interval}, period={period}")
+        return df
     except Exception as e:
-        print(f"[!] Failed to fetch {symbol} with error: {e}")
+        print(f"[!] Error fetching data for {symbol}: {e}")
         return pd.DataFrame()
 
 def elder_not_red(df, ema_length, macd_fast, macd_slow, macd_signal):
-    ema = EMAIndicator(df['Close'], window=ema_length).ema_indicator()
-    macd = MACD(df['Close'], macd_fast, macd_slow, macd_signal)
+    ema = EMAIndicator(close=df['Close'], window=ema_length).ema_indicator()
+    macd = MACD(close=df['Close'], window_slow=macd_slow, window_fast=macd_fast, window_sign=macd_signal)
     hist = macd.macd_diff()
     return (ema > ema.shift(1)) | (hist > hist.shift(1))
 
@@ -34,57 +32,55 @@ def backtest(params, timeframe):
     df = get_data_yf(SYMBOL, timeframe, f"{LOOKBACK_DAYS}d")
     vix = get_data_yf(VIX_SYMBOL, "15m", "5d")
 
-    if df.empty or vix.empty:
-        print(f"[!] Skipping backtest due to missing data.")
-        return -np.inf
+    if df.empty or vix.empty or 'Close' not in df.columns or 'Close' not in vix.columns:
+        print(f"[!] Skipping due to missing data for TF={timeframe} with params {params}")
+        return -9999
 
-    df['rsi'] = RSIIndicator(df['Close'], rsi_len).rsi()
-    macd = MACD(df['Close'], macd_f, macd_s, macd_sig)
+    df['Close'] = df['Close'].astype(float)
+    vix['Close'] = vix['Close'].astype(float)
+
+    df['rsi'] = RSIIndicator(close=df['Close'], window=rsi_len).rsi()
+    macd = MACD(close=df['Close'], window_fast=macd_f, window_slow=macd_s, window_sign=macd_sig)
     df['macd'] = macd.macd()
     df['signal'] = macd.macd_signal()
     df['hist'] = macd.macd_diff()
-    df['ema'] = EMAIndicator(df['Close'], ema_len).ema_indicator()
+    df['ema'] = EMAIndicator(close=df['Close'], window=ema_len).ema_indicator()
+
     df['rsi_rising'] = df['rsi'] > df['rsi'].shift(1)
     df['impulse_ok'] = elder_not_red(df, ema_len, macd_f, macd_s, macd_sig)
     vix['vix_rising'] = vix['Close'] > vix['Close'].shift(1)
 
     position = False
-    equity = 1_000
+    equity = 1000
     balance = equity
     shares = 0
 
     for i in range(1, len(df)):
+        latest = df.iloc[i]
+        vix_ok = not vix.iloc[-1]['vix_rising'] if len(vix) > 1 else True
+
         try:
-            latest = df.iloc[i]
-            vix_ok = not vix.iloc[-1]['vix_rising'] if not vix.empty else True
-
-            rsi_rising_val = bool(latest['rsi_rising']) if pd.notna(latest['rsi_rising']) else False
-            impulse_ok_val = bool(latest['impulse_ok']) if pd.notna(latest['impulse_ok']) else False
-
             entry = (
-                latest['macd'] > latest['signal'] and
+                bool(latest['macd'] > latest['signal']) and
                 rsi_entry_min < latest['rsi'] < rsi_entry_max and
-                rsi_rising_val and
-                impulse_ok_val and
+                bool(latest['rsi_rising']) and
+                bool(latest['impulse_ok']) and
                 vix_ok
             )
-
-            exit = latest['rsi'] < rsi_exit
-
-            if entry and not position:
-                buy_price = latest['Close']
-                shares = balance / buy_price
-                position = True
-
-            elif exit and position:
-                sell_price = latest['Close']
-                balance = shares * sell_price
-                shares = 0
-                position = False
-
+            exit = bool(latest['rsi'] < rsi_exit)
         except Exception as e:
-            print(f"[!] Error in loop at index {i}: {e}")
-            continue
+            print(f"[!] Error evaluating signals on TF={timeframe}: {e}")
+            return -9999
+
+        if entry and not position:
+            buy_price = latest['Close']
+            shares = balance / buy_price
+            position = True
+        elif exit and position:
+            sell_price = latest['Close']
+            balance = shares * sell_price
+            shares = 0
+            position = False
 
     final_value = balance if not position else shares * df.iloc[-1]['Close']
     total_return = (final_value / equity - 1) * 100
@@ -94,7 +90,7 @@ def optimize():
     best_result = -np.inf
     best_params = None
     results = []
-    timeframes = ["15m", "30m", "1h", "4h"]
+    timeframes = ["15m", "30m", "1h", "2h"]
 
     rsi_lens = [10, 12, 14]
     rsi_entries = [(50, 65), (52, 64), (54, 62)]
@@ -106,7 +102,6 @@ def optimize():
 
     for tf in timeframes:
         param_grid = product(rsi_lens, rsi_entries, rsi_exits, macd_fast_vals, macd_slow_vals, macd_signal_vals, ema_lens)
-
         for rsi_len, (entry_min, entry_max), rsi_exit, macd_f, macd_s, macd_sig, ema_len in param_grid:
             try:
                 result = backtest((rsi_len, entry_min, entry_max, rsi_exit, macd_f, macd_s, macd_sig, ema_len), tf)
@@ -122,11 +117,10 @@ def optimize():
                     "ema": ema_len,
                     "return": result
                 })
+                print(f"TF={tf} Params RSI={rsi_len}, Entry=({entry_min}-{entry_max}), Exit={rsi_exit}, MACD=({macd_f},{macd_s},{macd_sig}), EMA={ema_len} → Return={result:.2f}%")
                 if result > best_result:
                     best_result = result
                     best_params = (rsi_len, entry_min, entry_max, rsi_exit, macd_f, macd_s, macd_sig, ema_len, tf)
-                print(f"TF={tf} Tested RSI={rsi_len}, Entry=({entry_min}-{entry_max}), Exit={rsi_exit}, MACD=({macd_f},{macd_s},{macd_sig}), EMA={ema_len} → Return={result:.2f}%")
-
             except Exception as e:
                 print(f"[!] Error on TF={tf} with params {(rsi_len, entry_min, entry_max, rsi_exit, macd_f, macd_s, macd_sig, ema_len)}: {e}")
 
@@ -134,14 +128,14 @@ def optimize():
     print(f"Return: {best_result:.2f}%")
     print(f"Params: RSI={best_params[0]}, Entry=({best_params[1]}, {best_params[2]}), Exit={best_params[3]}, MACD=({best_params[4]},{best_params[5]},{best_params[6]}), EMA={best_params[7]}, Timeframe={best_params[8]}")
 
-    # Tabular output
+    # Results table
     df_results = pd.DataFrame(results)
     print("\nTop 10 Results:")
     print(df_results.sort_values(by="return", ascending=False).head(10))
 
     # Heatmap
     pivot = df_results.pivot_table(index="timeframe", columns="macd_fast", values="return", aggfunc=np.max)
-    plt.figure(figsize=(10,6))
+    plt.figure(figsize=(10, 6))
     sns.heatmap(pivot, annot=True, fmt=".1f", cmap="coolwarm")
     plt.title("Max Return Heatmap: Timeframe vs MACD Fast")
     plt.xlabel("MACD Fast")
