@@ -1,90 +1,126 @@
 import pandas as pd
 import numpy as np
-from alpaca_trade_api.rest import REST, TimeFrame
 from ta.momentum import RSIIndicator
 from ta.trend import MACD, EMAIndicator
+import yfinance as yf
+import matplotlib.pyplot as plt
+import seaborn as sns
 import datetime as dt
-import requests
-import os
-
-API_KEY = os.getenv("APCA_API_KEY")
-API_SECRET = os.getenv("APCA_API_SECRET")
-BASE_URL = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+from itertools import product
 
 SYMBOL = "TQQQ"
 VIX_SYMBOL = "VIXY"
-TIMEFRAME = TimeFrame.Hour
-TIMEFRAME_5MIN = TimeFrame(5, TimeFrame.Minute)
-LOOKBACK = 100
+LOOKBACK_DAYS = 60
 
-api = REST(API_KEY, API_SECRET, BASE_URL)
+def get_data_yf(symbol, interval, period):
+    return yf.download(symbol, interval=interval, period=period)
 
-def get_data(symbol, timeframe, lookback):
-    start = (dt.datetime.now() - dt.timedelta(hours=lookback + 5)).replace(microsecond=0).isoformat() + 'Z'
-    bars = api.get_bars(symbol, timeframe, start=start).df
-    if 'symbol' in bars.columns:
-        return bars[bars['symbol'] == symbol].copy()
-    else:
-        return bars.copy()
-
-def elder_not_red(df):
-    ema = EMAIndicator(df['close'], window=13).ema_indicator()
-    macd = MACD(df['close'], 8, 21, 11)
+def elder_not_red(df, ema_length, macd_fast, macd_slow, macd_signal):
+    ema = EMAIndicator(df['Close'], window=ema_length).ema_indicator()
+    macd = MACD(df['Close'], macd_fast, macd_slow, macd_signal)
     hist = macd.macd_diff()
     return (ema > ema.shift(1)) | (hist > hist.shift(1))
 
-def send_telegram(msg):
-    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
-        r = requests.post(url, data=data)
-        if r.status_code != 200:
-            print(f"Telegram send error: {r.text}")
+def backtest(params, timeframe):
+    rsi_len, rsi_entry_min, rsi_entry_max, rsi_exit, macd_f, macd_s, macd_sig, ema_len = params
+    df = get_data_yf(SYMBOL, timeframe, f"{LOOKBACK_DAYS}d")
+    vix = get_data_yf(VIX_SYMBOL, "15m", "5d")
 
-def check_signals():
-    df = get_data(SYMBOL, TIMEFRAME, LOOKBACK)
-    df_5min = get_data(SYMBOL, TIMEFRAME_5MIN, LOOKBACK * 12)
-    vix = get_data(VIX_SYMBOL, TimeFrame.Minute, 15)
-
-    df['rsi'] = RSIIndicator(df['close'], 12).rsi()
-    macd = MACD(df['close'], 8, 21, 11)
+    df['rsi'] = RSIIndicator(df['Close'], rsi_len).rsi()
+    macd = MACD(df['Close'], macd_f, macd_s, macd_sig)
     df['macd'] = macd.macd()
     df['signal'] = macd.macd_signal()
     df['hist'] = macd.macd_diff()
-    df['ema'] = EMAIndicator(df['close'], window=13).ema_indicator()
+    df['ema'] = EMAIndicator(df['Close'], ema_len).ema_indicator()
     df['rsi_rising'] = df['rsi'] > df['rsi'].shift(1)
-    df['impulse_ok'] = elder_not_red(df)
+    df['impulse_ok'] = elder_not_red(df, ema_len, macd_f, macd_s, macd_sig)
+    vix['vix_rising'] = vix['Close'] > vix['Close'].shift(1)
 
-    vix['vix_rising'] = vix['close'] > vix['close'].shift(1)
-    vix_ok = not vix.iloc[-1]['vix_rising']
+    position = False
+    equity = 1_000
+    balance = equity
+    shares = 0
 
-    latest = df.iloc[-1]
-    entry = (
-        latest['macd'] > latest['signal'] and
-        52 < latest['rsi'] < 64 and
-        latest['rsi_rising'] and
-        latest['impulse_ok'] and
-        vix_ok
-    )
-    exit = latest['rsi'] < 48
+    for i in range(1, len(df)):
+        latest = df.iloc[i]
+        vix_ok = not vix.iloc[-1]['vix_rising'] if len(vix) > 1 else True
+        entry = (
+            latest['macd'] > latest['signal'] and
+            rsi_entry_min < latest['rsi'] < rsi_entry_max and
+            latest['rsi_rising'] and
+            latest['impulse_ok'] and
+            vix_ok
+        )
+        exit = latest['rsi'] < rsi_exit
 
-    try:
-        position = api.get_open_position(SYMBOL)
-        in_position = True
-    except:
-        in_position = False
+        if entry and not position:
+            buy_price = latest['Close']
+            shares = balance / buy_price
+            position = True
+        elif exit and position:
+            sell_price = latest['Close']
+            balance = shares * sell_price
+            shares = 0
+            position = False
 
-    if entry and not in_position:
-        api.submit_order(symbol=SYMBOL, qty=1, side='buy', type='market', time_in_force='gtc')
-        send_telegram(f"🚀 BUY {SYMBOL} at {latest['close']:.2f}")
-    elif exit and in_position:
-        api.submit_order(symbol=SYMBOL, qty=1, side='sell', type='market', time_in_force='gtc')
-        send_telegram(f"🔻 SELL {SYMBOL} at {latest['close']:.2f}")
-    else:
-        print("⏳ No action")
-        send_telegram(f" TTTEEESSSTTT  {SYMBOL} at {latest['close']:.2f}")
+    final_value = balance if not position else shares * df.iloc[-1]['Close']
+    total_return = (final_value / equity - 1) * 100
+    return total_return
+
+def optimize():
+    best_result = -np.inf
+    best_params = None
+    results = []
+    timeframes = ["15m", "30m", "1h", "2h"]
+
+    rsi_lens = [10, 12, 14]
+    rsi_entries = [(50, 65), (52, 64), (54, 62)]
+    rsi_exits = [45, 48, 50]
+    macd_fast_vals = [8, 12]
+    macd_slow_vals = [21, 26]
+    macd_signal_vals = [9, 11]
+    ema_lens = [13, 20]
+
+    for tf in timeframes:
+        param_grid = product(rsi_lens, rsi_entries, rsi_exits, macd_fast_vals, macd_slow_vals, macd_signal_vals, ema_lens)
+
+        for rsi_len, (entry_min, entry_max), rsi_exit, macd_f, macd_s, macd_sig, ema_len in param_grid:
+            result = backtest((rsi_len, entry_min, entry_max, rsi_exit, macd_f, macd_s, macd_sig, ema_len), tf)
+            results.append({
+                "timeframe": tf,
+                "rsi": rsi_len,
+                "rsi_min": entry_min,
+                "rsi_max": entry_max,
+                "rsi_exit": rsi_exit,
+                "macd_fast": macd_f,
+                "macd_slow": macd_s,
+                "macd_signal": macd_sig,
+                "ema": ema_len,
+                "return": result
+            })
+            if result > best_result:
+                best_result = result
+                best_params = (rsi_len, entry_min, entry_max, rsi_exit, macd_f, macd_s, macd_sig, ema_len, tf)
+            print(f"TF={tf} Tested RSI={rsi_len}, Entry=({entry_min}-{entry_max}), Exit={rsi_exit}, MACD=({macd_f},{macd_s},{macd_sig}), EMA={ema_len} → Return={result:.2f}%")
+
+    print("\nBest Result:")
+    print(f"Return: {best_result:.2f}%")
+    print(f"Params: RSI={best_params[0]}, Entry=({best_params[1]}, {best_params[2]}), Exit={best_params[3]}, MACD=({best_params[4]},{best_params[5]},{best_params[6]}), EMA={best_params[7]}, Timeframe={best_params[8]}")
+
+    # Tabellarische Ausgabe
+    df_results = pd.DataFrame(results)
+    print("\nTop 10 Ergebnisse:")
+    print(df_results.sort_values(by="return", ascending=False).head(10))
+
+    # Heatmap Plot (Timeframe vs Return)
+    pivot = df_results.pivot_table(index="timeframe", columns="macd_fast", values="return", aggfunc=np.max)
+    plt.figure(figsize=(10,6))
+    sns.heatmap(pivot, annot=True, fmt=".1f", cmap="coolwarm")
+    plt.title("Max Return Heatmap: Timeframe vs MACD Fast")
+    plt.xlabel("MACD Fast")
+    plt.ylabel("Timeframe")
+    plt.tight_layout()
+    plt.show()
 
 if __name__ == "__main__":
-    check_signals()
+    optimize()
