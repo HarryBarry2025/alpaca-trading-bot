@@ -16,6 +16,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SYMBOL = "TQQQ"
 VIX_SYMBOL = "VIXY"
 TIMEFRAME = TimeFrame.Hour
+TIMEFRAME_5MIN = TimeFrame(5, TimeFrame.Unit.Minute)
 LOOKBACK = 100
 
 api = REST(API_KEY, API_SECRET, BASE_URL)
@@ -45,6 +46,7 @@ def send_telegram(msg):
 
 def check_signals():
     df = get_data(SYMBOL, TIMEFRAME, LOOKBACK)
+    df_5min = get_data(SYMBOL, TIMEFRAME_5MIN, LOOKBACK * 12)
     vix = get_data(VIX_SYMBOL, TimeFrame.Minute, 15)
 
     df['rsi'] = RSIIndicator(df['close'], 12).rsi()
@@ -83,6 +85,7 @@ def check_signals():
         send_telegram(f"🔻 SELL {SYMBOL} at {latest['close']:.2f}")
     else:
         print("⏳ No action")
+        send_telegram(f"🔻 Test {SYMBOL} at {latest['close']:.2f}")
 
 if __name__ == "__main__":
     check_signals()
