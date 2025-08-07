@@ -16,15 +16,16 @@ def get_data_yf(symbol, interval, period):
         df = yf.download(symbol, interval=interval, period=period, auto_adjust=False)
         if df.empty:
             print(f"[!] No data for {symbol} with interval={interval}, period={period}")
-        df['Close'] = df['Close'].astype(float).squeeze()
+        df["Close"] = df["Close"].astype(float).squeeze()
         return df
     except Exception as e:
         print(f"[!] Error fetching data for {symbol}: {e}")
         return pd.DataFrame()
 
 def elder_not_red(df, ema_length, macd_fast, macd_slow, macd_signal):
-    ema = EMAIndicator(close=df['Close'], window=ema_length).ema_indicator()
-    macd = MACD(close=df['Close'], window_slow=macd_slow, window_fast=macd_fast, window_sign=macd_signal)
+    close = df["Close"].astype(float).squeeze()
+    ema = EMAIndicator(close=close, window=ema_length).ema_indicator()
+    macd = MACD(close=close, window_slow=macd_slow, window_fast=macd_fast, window_sign=macd_signal)
     hist = macd.macd_diff()
     return ((ema > ema.shift(1)) | (hist > hist.shift(1))).astype(bool)
 
@@ -37,12 +38,14 @@ def backtest(params, timeframe):
         print(f"[!] Skipping due to missing data for TF={timeframe} with params {params}")
         return -9999
 
-    df['rsi'] = RSIIndicator(close=df['Close'], window=rsi_len).rsi()
-    macd = MACD(close=df['Close'], window_fast=macd_f, window_slow=macd_s, window_sign=macd_sig)
+    close = df["Close"].astype(float).squeeze()
+
+    df['rsi'] = RSIIndicator(close=close, window=rsi_len).rsi()
+    macd = MACD(close=close, window_fast=macd_f, window_slow=macd_s, window_sign=macd_sig)
     df['macd'] = macd.macd()
     df['signal'] = macd.macd_signal()
     df['hist'] = macd.macd_diff()
-    df['ema'] = EMAIndicator(close=df['Close'], window=ema_len).ema_indicator()
+    df['ema'] = EMAIndicator(close=close, window=ema_len).ema_indicator()
 
     df['rsi_rising'] = df['rsi'] > df['rsi'].shift(1)
     df['impulse_ok'] = elder_not_red(df, ema_len, macd_f, macd_s, macd_sig)
@@ -143,4 +146,5 @@ def optimize():
 
 if __name__ == "__main__":
     optimize()
+
 
