@@ -13,11 +13,16 @@ VIX_SYMBOL = "VIXY"
 LOOKBACK_DAYS = 60
 
 def get_data_yf(symbol, interval, period):
-    return yf.download(symbol, interval=interval, period=period)
+    df = yf.download(symbol, interval=interval, period=period)
+    if df.empty or 'Close' not in df.columns:
+        raise ValueError(f"No data returned for {symbol} with interval={interval}, period={period}")
+    df.dropna(inplace=True)
+    return df
 
 def elder_not_red(df, ema_length, macd_fast, macd_slow, macd_signal):
-    ema = EMAIndicator(df['Close'], window=ema_length).ema_indicator()
-    macd = MACD(df['Close'], macd_fast, macd_slow, macd_signal)
+    close_series = df['Close'].squeeze()
+    ema = EMAIndicator(close_series, window=ema_length).ema_indicator()
+    macd = MACD(close_series, macd_fast, macd_slow, macd_signal)
     hist = macd.macd_diff()
     return (ema > ema.shift(1)) | (hist > hist.shift(1))
 
@@ -26,15 +31,21 @@ def backtest(params, timeframe):
     df = get_data_yf(SYMBOL, timeframe, f"{LOOKBACK_DAYS}d")
     vix = get_data_yf(VIX_SYMBOL, "15m", "5d")
 
-    df['rsi'] = RSIIndicator(df['Close'], rsi_len).rsi()
-    macd = MACD(df['Close'], macd_f, macd_s, macd_sig)
+    close_series = df['Close'].squeeze()
+
+    df['rsi'] = RSIIndicator(close=close_series, window=rsi_len).rsi()
+    macd = MACD(close=close_series, window_slow=macd_s, window_fast=macd_f, window_sign=macd_sig)
     df['macd'] = macd.macd()
     df['signal'] = macd.macd_signal()
     df['hist'] = macd.macd_diff()
-    df['ema'] = EMAIndicator(df['Close'], ema_len).ema_indicator()
+    df['ema'] = EMAIndicator(close=close_series, window=ema_len).ema_indicator()
     df['rsi_rising'] = df['rsi'] > df['rsi'].shift(1)
     df['impulse_ok'] = elder_not_red(df, ema_len, macd_f, macd_s, macd_sig)
     vix['vix_rising'] = vix['Close'] > vix['Close'].shift(1)
+
+    df.dropna(inplace=True)
+    if df.empty:
+        return -np.inf
 
     position = False
     equity = 1_000
@@ -85,23 +96,30 @@ def optimize():
         param_grid = product(rsi_lens, rsi_entries, rsi_exits, macd_fast_vals, macd_slow_vals, macd_signal_vals, ema_lens)
 
         for rsi_len, (entry_min, entry_max), rsi_exit, macd_f, macd_s, macd_sig, ema_len in param_grid:
-            result = backtest((rsi_len, entry_min, entry_max, rsi_exit, macd_f, macd_s, macd_sig, ema_len), tf)
-            results.append({
-                "timeframe": tf,
-                "rsi": rsi_len,
-                "rsi_min": entry_min,
-                "rsi_max": entry_max,
-                "rsi_exit": rsi_exit,
-                "macd_fast": macd_f,
-                "macd_slow": macd_s,
-                "macd_signal": macd_sig,
-                "ema": ema_len,
-                "return": result
-            })
-            if result > best_result:
-                best_result = result
-                best_params = (rsi_len, entry_min, entry_max, rsi_exit, macd_f, macd_s, macd_sig, ema_len, tf)
-            print(f"TF={tf} Tested RSI={rsi_len}, Entry=({entry_min}-{entry_max}), Exit={rsi_exit}, MACD=({macd_f},{macd_s},{macd_sig}), EMA={ema_len} → Return={result:.2f}%")
+            try:
+                result = backtest((rsi_len, entry_min, entry_max, rsi_exit, macd_f, macd_s, macd_sig, ema_len), tf)
+                results.append({
+                    "timeframe": tf,
+                    "rsi": rsi_len,
+                    "rsi_min": entry_min,
+                    "rsi_max": entry_max,
+                    "rsi_exit": rsi_exit,
+                    "macd_fast": macd_f,
+                    "macd_slow": macd_s,
+                    "macd_signal": macd_sig,
+                    "ema": ema_len,
+                    "return": result
+                })
+                if result > best_result:
+                    best_result = result
+                    best_params = (rsi_len, entry_min, entry_max, rsi_exit, macd_f, macd_s, macd_sig, ema_len, tf)
+                print(f"TF={tf} Tested RSI={rsi_len}, Entry=({entry_min}-{entry_max}), Exit={rsi_exit}, MACD=({macd_f},{macd_s},{macd_sig}), EMA={ema_len} → Return={result:.2f}%")
+            except Exception as e:
+                print(f"Error on TF={tf} with params {rsi_len, entry_min, entry_max, rsi_exit, macd_f, macd_s, macd_sig, ema_len}: {e}")
+
+    if not results:
+        print("No valid backtest results.")
+        return
 
     print("\nBest Result:")
     print(f"Return: {best_result:.2f}%")
