@@ -16,18 +16,16 @@ def get_data_yf(symbol, interval, period):
         df = yf.download(symbol, interval=interval, period=period, auto_adjust=False)
         if df.empty:
             print(f"[!] No data for {symbol} with interval={interval}, period={period}")
-        df["Close"] = df["Close"].astype(float).squeeze()
         return df
     except Exception as e:
         print(f"[!] Error fetching data for {symbol}: {e}")
         return pd.DataFrame()
 
-def elder_not_red(df, ema_length, macd_fast, macd_slow, macd_signal):
-    close = df["Close"].astype(float).squeeze()
-    ema = EMAIndicator(close=close, window=ema_length).ema_indicator()
-    macd = MACD(close=close, window_slow=macd_slow, window_fast=macd_fast, window_sign=macd_signal)
+def elder_not_red(close_series, ema_length, macd_fast, macd_slow, macd_signal):
+    ema = EMAIndicator(close=close_series, window=ema_length).ema_indicator()
+    macd = MACD(close=close_series, window_slow=macd_slow, window_fast=macd_fast, window_sign=macd_signal)
     hist = macd.macd_diff()
-    return ((ema > ema.shift(1)) | (hist > hist.shift(1))).astype(bool)
+    return (ema > ema.shift(1)) | (hist > hist.shift(1))
 
 def backtest(params, timeframe):
     rsi_len, rsi_entry_min, rsi_entry_max, rsi_exit, macd_f, macd_s, macd_sig, ema_len = params
@@ -38,7 +36,10 @@ def backtest(params, timeframe):
         print(f"[!] Skipping due to missing data for TF={timeframe} with params {params}")
         return -9999
 
-    close = df["Close"].astype(float).squeeze()
+    df['Close'] = df['Close'].astype(float)
+    vix['Close'] = vix['Close'].astype(float)
+
+    close = df['Close']
 
     df['rsi'] = RSIIndicator(close=close, window=rsi_len).rsi()
     macd = MACD(close=close, window_fast=macd_f, window_slow=macd_s, window_sign=macd_sig)
@@ -48,7 +49,7 @@ def backtest(params, timeframe):
     df['ema'] = EMAIndicator(close=close, window=ema_len).ema_indicator()
 
     df['rsi_rising'] = df['rsi'] > df['rsi'].shift(1)
-    df['impulse_ok'] = elder_not_red(df, ema_len, macd_f, macd_s, macd_sig)
+    df['impulse_ok'] = elder_not_red(close, ema_len, macd_f, macd_s, macd_sig)
     vix['vix_rising'] = vix['Close'] > vix['Close'].shift(1)
 
     position = False
@@ -62,13 +63,13 @@ def backtest(params, timeframe):
 
         try:
             entry = (
-                bool(latest['macd'] > latest['signal']) and
-                rsi_entry_min < latest['rsi'] < rsi_entry_max and
-                bool(latest['rsi_rising']) and
-                bool(latest['impulse_ok']) and
+                (latest['macd'] > latest['signal']) and
+                (rsi_entry_min < latest['rsi'] < rsi_entry_max) and
+                (latest['rsi_rising']) and
+                (latest['impulse_ok']) and
                 vix_ok
             )
-            exit = bool(latest['rsi'] < rsi_exit)
+            exit = latest['rsi'] < rsi_exit
         except Exception as e:
             print(f"[!] Error evaluating signals on TF={timeframe}: {e}")
             return -9999
@@ -127,24 +128,4 @@ def optimize():
 
     print("\nBest Result:")
     print(f"Return: {best_result:.2f}%")
-    print(f"Params: RSI={best_params[0]}, Entry=({best_params[1]}, {best_params[2]}), Exit={best_params[3]}, MACD=({best_params[4]},{best_params[5]},{best_params[6]}), EMA={best_params[7]}, Timeframe={best_params[8]}")
-
-    # Results table
-    df_results = pd.DataFrame(results)
-    print("\nTop 10 Results:")
-    print(df_results.sort_values(by="return", ascending=False).head(10))
-
-    # Heatmap
-    pivot = df_results.pivot_table(index="timeframe", columns="macd_fast", values="return", aggfunc=np.max)
-    plt.figure(figsize=(10, 6))
-    sns.heatmap(pivot, annot=True, fmt=".1f", cmap="coolwarm")
-    plt.title("Max Return Heatmap: Timeframe vs MACD Fast")
-    plt.xlabel("MACD Fast")
-    plt.ylabel("Timeframe")
-    plt.tight_layout()
-    plt.show()
-
-if __name__ == "__main__":
-    optimize()
-
-
+    print(f"Params: RSI={best_params[0]}, Entry=({best_params
