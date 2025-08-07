@@ -63,14 +63,18 @@ def backtest(params, timeframe):
         vix_ok = not vix.iloc[-1]['vix_rising'] if len(vix) > 1 else True
 
         try:
+            rsi_rising_val = bool(latest['rsi_rising']) if pd.notna(latest['rsi_rising']) else False
+            impulse_ok_val = bool(latest['impulse_ok']) if pd.notna(latest['impulse_ok']) else False
+
             entry = (
                 latest['macd'] > latest['signal'] and
                 rsi_entry_min < latest['rsi'] < rsi_entry_max and
-                latest['rsi_rising'] is True and
-                latest['impulse_ok'] is True and
+                rsi_rising_val and
+                impulse_ok_val and
                 vix_ok
             )
-        except Exception:
+        except Exception as e:
+            print(f"[!] Entry evaluation error at index {i}: {e}")
             entry = False
 
         exit = latest['rsi'] < rsi_exit
@@ -93,7 +97,7 @@ def optimize():
     best_result = -np.inf
     best_params = None
     results = []
-    timeframes = ["15m", "30m", "1h", "4h"]  # Updated intervals
+    timeframes = ["15m", "30m", "1h", "4h"]  # Valid yfinance intervals
 
     rsi_lens = [10, 12, 14]
     rsi_entries = [(50, 65), (52, 64), (54, 62)]
@@ -136,12 +140,10 @@ def optimize():
     print(f"Return: {best_result:.2f}%")
     print(f"Params: RSI={best_params[0]}, Entry=({best_params[1]}, {best_params[2]}), Exit={best_params[3]}, MACD=({best_params[4]},{best_params[5]},{best_params[6]}), EMA={best_params[7]}, Timeframe={best_params[8]}")
 
-    # Tabular results
     df_results = pd.DataFrame(results)
     print("\nTop 10 Results:")
     print(df_results.sort_values(by="return", ascending=False).head(10))
 
-    # Heatmap: Timeframe vs MACD Fast
     pivot = df_results.pivot_table(index="timeframe", columns="macd_fast", values="return", aggfunc=np.max)
     plt.figure(figsize=(10, 6))
     sns.heatmap(pivot, annot=True, fmt=".1f", cmap="coolwarm")
