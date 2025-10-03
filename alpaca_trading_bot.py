@@ -229,6 +229,22 @@ async def telegram_webhook(req: Request):
 async def root():
     return {"ok": True, "live": CONFIG.live_enabled, "symbol": CONFIG.symbol, "interval": CONFIG.interval}
 
+# ==================== Diagnose ==========================
+@app.get("/envcheck")
+def envcheck():
+    def chk(k): 
+        v = os.getenv(k); 
+        return {"present": bool(v), "len": len(v) if v else 0}
+    return {
+        "TELEGRAM_BOT_TOKEN": chk("TELEGRAM_BOT_TOKEN"),
+        "BASE_URL": chk("BASE_URL"),
+        "TELEGRAM_WEBHOOK_SECRET": chk("TELEGRAM_WEBHOOK_SECRET"),
+        "DEFAULT_CHAT_ID": chk("DEFAULT_CHAT_ID"),
+        "APCA_API_KEY_ID": chk("APCA_API_KEY_ID"),
+        "APCA_API_SECRET_KEY": chk("APCA_API_SECRET_KEY"),
+        "APCA_API_BASE_URL": chk("APCA_API_BASE_URL"),
+    }
+
 # Cron-friendly tick
 @app.get("/tick")
 async def tick():
