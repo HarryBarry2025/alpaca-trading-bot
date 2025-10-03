@@ -327,14 +327,7 @@ async def lifespan(app: FastAPI):
         tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
         # Polling als Hintergrundtask
-        polling_task = asyncio.create_task(
-            tg_app.run_polling(
-                allowed_updates=Update.ALL_TYPES,
-                close_bot_session=True,
-                drop_pending_updates=False,
-                stop_signals=None
-            )
-        )
+        polling_task = asyncio.create_task(tg_app.run_polling())
         tg_running = True
         print("🚀 Telegram POLLING gestartet")
     except Exception as e:
