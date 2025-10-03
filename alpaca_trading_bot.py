@@ -307,16 +307,15 @@ async def on_message(update, context):
 
 # ========= Lifespan (Polling, non-blocking) =========
 from contextlib import asynccontextmanager
-
-tg_app: Optional[Application]  # redeclare for type hints
+import traceback
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global tg_app, tg_running
-    polling_task = None
     try:
         tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+        # Handler registrieren
         tg_app.add_handler(CommandHandler("start",   cmd_start))
         tg_app.add_handler(CommandHandler("status",  cmd_status))
         tg_app.add_handler(CommandHandler("set",     cmd_set))
@@ -326,8 +325,16 @@ async def lifespan(app: FastAPI):
         tg_app.add_handler(CommandHandler("bt",      cmd_bt))
         tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
-        # Polling als Hintergrundtask
-        polling_task = asyncio.create_task(tg_app.run_polling())
+        # --- Eingebettetes POLLING (PTB 20.7 kompatibel) ---
+        await tg_app.initialize()
+        await tg_app.start()
+        try:
+            # falls früher mal Webhook gesetzt war
+            await tg_app.bot.delete_webhook(drop_pending_updates=False)
+        except Exception as e:
+            print("delete_webhook warn:", e)
+        # Updater-basiertes Polling innerhalb der bestehenden Event Loop starten
+        await tg_app.updater.start_polling()
         tg_running = True
         print("🚀 Telegram POLLING gestartet")
     except Exception as e:
@@ -338,12 +345,14 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         tg_running = False
-        if polling_task and not polling_task.done():
-            polling_task.cancel()
-            try:
-                await polling_task
-            except Exception:
-                pass
+        try:
+            await tg_app.updater.stop()
+        except Exception:
+            pass
+        try:
+            await tg_app.stop()
+        except Exception:
+            pass
         try:
             await tg_app.shutdown()
         except Exception:
