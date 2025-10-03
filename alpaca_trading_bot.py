@@ -229,11 +229,37 @@ async def telegram_webhook(req: Request):
 async def root():
     return {"ok": True, "live": CONFIG.live_enabled, "symbol": CONFIG.symbol, "interval": CONFIG.interval}
 
-# ==================== Diagnose ==========================
+
+
+
+
+# ========= HEALTH & DIAGNOSE ROUTES =========
+
+@app.get("/")
+async def root():
+    """Health check: zeigt Basisstatus der Strategie."""
+    return {
+        "ok": True,
+        "live": CONFIG.live_enabled,
+        "symbol": CONFIG.symbol,
+        "interval": CONFIG.interval
+    }
+
+@app.get("/tick")
+async def tick():
+    """Cron-/Ping-freundlich: führt einen Strategy-Check aus, wenn live mode ON ist."""
+    if not CONFIG.live_enabled:
+        return {"ran": False, "reason": "live_disabled"}
+    if CHAT_ID is None:
+        return {"ran": False, "reason": "no_chat_id (use /start in Telegram)"}
+    await run_once_and_report(CHAT_ID)
+    return {"ran": True}
+
 @app.get("/envcheck")
 def envcheck():
+    """Diagnose: zeigt ob die ENV Variablen vorhanden sind (ohne Secrets auszudrucken)."""
     def chk(k): 
-        v = os.getenv(k); 
+        v = os.getenv(k)
         return {"present": bool(v), "len": len(v) if v else 0}
     return {
         "TELEGRAM_BOT_TOKEN": chk("TELEGRAM_BOT_TOKEN"),
@@ -245,12 +271,3 @@ def envcheck():
         "APCA_API_BASE_URL": chk("APCA_API_BASE_URL"),
     }
 
-# Cron-friendly tick
-@app.get("/tick")
-async def tick():
-    if not CONFIG.live_enabled:
-        return {"ran": False, "reason": "live_disabled"}
-    if CHAT_ID is None:
-        return {"ran": False, "reason": "no_chat_id (use /start)"}
-    await run_once_and_report(CHAT_ID)
-    return {"ran": True}
