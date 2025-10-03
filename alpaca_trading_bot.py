@@ -157,36 +157,59 @@ async def send(chat_id: str, text: str):
 # ... cmd_start / cmd_status / cmd_set / cmd_cfg / cmd_live / run_once_and_report / cmd_run / cmd_bt / on_message ...
 
 # ========= Lifespan (ersetzt @app.on_event) =========
+from contextlib import asynccontextmanager
+import asyncio
+import traceback
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """
+    Startet Telegram im POLLING-Modus als Hintergrundtask (non-blocking),
+    damit FastAPI parallel weiterläuft. Robust mit Fehler-Logs.
+    """
     global tg_app, tg_running
-    # Startup
-    tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
-    tg_app.add_handler(CommandHandler("start",   cmd_start))
-    tg_app.add_handler(CommandHandler("status",  cmd_status))
-    tg_app.add_handler(CommandHandler("set",     cmd_set))
-    tg_app.add_handler(CommandHandler("cfg",     cmd_cfg))
-    tg_app.add_handler(CommandHandler("run",     cmd_run))
-    tg_app.add_handler(CommandHandler("live",    cmd_live))
-    tg_app.add_handler(CommandHandler("bt",      cmd_bt))
-    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    try:
+        tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    if not BASE_URL:
-        print("⚠️ BASE_URL not set; bot will not receive webhooks.")
-    else:
-        url = f"{BASE_URL}/telegram/{WEBHOOK_SECRET}"
-        try:
-            await tg_app.bot.set_webhook(url)
-            print("Webhook set to:", url)
-        except Exception as e:
-            print("Failed to set webhook:", e)
+        # Handlers registrieren
+        tg_app.add_handler(CommandHandler("start",   cmd_start))
+        tg_app.add_handler(CommandHandler("status",  cmd_status))
+        tg_app.add_handler(CommandHandler("set",     cmd_set))
+        tg_app.add_handler(CommandHandler("cfg",     cmd_cfg))
+        tg_app.add_handler(CommandHandler("run",     cmd_run))
+        tg_app.add_handler(CommandHandler("live",    cmd_live))
+        tg_app.add_handler(CommandHandler("bt",      cmd_bt))
+        tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
-    tg_running = True
-    print("🚀 Startup complete")
-    yield
-    # Shutdown
-    tg_running = False
-    print("🛑 Shutdown complete")
+        # Hintergrund-Task: run_polling (blockierend) als Task starten
+        # stop_signals=None => Render sendet keine Unix-Signale (Windows-ähnliche Umgebung)
+        polling_task = asyncio.create_task(
+            tg_app.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                close_bot_session=True,
+                drop_pending_updates=False,
+                stop_signals=None
+            )
+        )
+        tg_running = True
+        print("🚀 Telegram POLLING gestartet")
+    except Exception as e:
+        print("❌ Fehler beim Telegram-Startup:", e)
+        traceback.print_exc()
+        polling_task = None
+
+    try:
+        yield  # ---- App läuft hier ----
+    finally:
+        tg_running = False
+        if polling_task and not polling_task.done():
+            polling_task.cancel()
+            try:
+                await polling_task
+            except Exception:
+                pass
+        print("🛑 Telegram POLLING gestoppt")
+
 
 # ========= FastAPI App =========
 app = FastAPI(title="TQQQ Strategy + Telegram", lifespan=lifespan)
