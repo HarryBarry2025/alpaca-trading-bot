@@ -1,0 +1,48 @@
+# render.yaml — Infrastructure as Code für Render
+
+services:
+  - type: web
+    name: alpaca-trading-bot
+    env: python
+    autoDeploy: true
+    plan: free            # oder: starter / standard / pro
+    region: frankfurt     # optional: oregon, virginia, frankfurt, singapore
+    rootDir: .            # falls dein Code im Unterordner liegt -> anpassen
+
+    buildCommand: |
+      pip install -r requirements.txt
+
+    startCommand: >
+      uvicorn alpaca_trading_bot:app
+      --host 0.0.0.0
+      --port ${PORT:-8000}
+
+    healthCheckPath: /
+    # Optional: Timeout/Frequency falls nötig
+    # healthCheckTimeout: 100
+    # healthCheckIntervalSeconds: 10
+
+    envVars:
+      # ---- Telegram ----
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false           # in Render UI setzen (Secret)
+      - key: DEFAULT_CHAT_ID
+        sync: false           # optional
+
+      # ---- Webhook (nur falls du später von Polling auf Webhook umstellst) ----
+      - key: BASE_URL
+        sync: false           # z.B. https://alpaca-trading-bot.onrender.com
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
+
+      # ---- Alpaca (optional, falls Orders/Daten über Alpaca laufen) ----
+      - key: APCA_API_KEY_ID
+        sync: false
+      - key: APCA_API_SECRET_KEY
+        sync: false
+      - key: APCA_API_BASE_URL
+        sync: false           # paper: https://paper-api.alpaca.markets
+
+      # ---- Sonstiges (falls genutzt) ----
+      # - key: SOME_FLAG
+      #   value: "1"
