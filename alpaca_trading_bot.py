@@ -307,15 +307,17 @@ async def on_message(update, context):
 
 # ========= Lifespan (Polling, non-blocking) =========
 from contextlib import asynccontextmanager
-import traceback
+import asyncio, traceback
+from telegram.error import Conflict
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global tg_app, tg_running
+    tg_running = False
     try:
         tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-        # Handler registrieren
+        # Handlers registrieren
         tg_app.add_handler(CommandHandler("start",   cmd_start))
         tg_app.add_handler(CommandHandler("status",  cmd_status))
         tg_app.add_handler(CommandHandler("set",     cmd_set))
@@ -325,18 +327,37 @@ async def lifespan(app: FastAPI):
         tg_app.add_handler(CommandHandler("bt",      cmd_bt))
         tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
-        # --- Eingebettetes POLLING (PTB 20.7 kompatibel) ---
+        # App initialisieren/öffnen
         await tg_app.initialize()
         await tg_app.start()
+
+        # Sicherstellen, dass KEIN Webhook aktiv ist und alte Updates verworfen werden
         try:
-            # falls früher mal Webhook gesetzt war
-            await tg_app.bot.delete_webhook(drop_pending_updates=False)
+            await tg_app.bot.delete_webhook(drop_pending_updates=True)
         except Exception as e:
             print("delete_webhook warn:", e)
-        # Updater-basiertes Polling innerhalb der bestehenden Event Loop starten
-        await tg_app.updater.start_polling()
+
+        # Polling starten – mit Conflict-Retry
+        async def start_polling_with_retry():
+            delay = 5
+            while True:
+                try:
+                    print("▶️ start polling…")
+                    await tg_app.updater.start_polling()  # non-blocking in aktueller Loop
+                    print("✅ polling läuft")
+                    return
+                except Conflict as e:
+                    print(f"⚠️ Conflict: {e}. Prüfe, ob eine zweite Instanz läuft. Retry in {delay}s…")
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 60)  # Backoff
+                except Exception:
+                    traceback.print_exc()
+                    await asyncio.sleep(10)
+
+        await start_polling_with_retry()
         tg_running = True
         print("🚀 Telegram POLLING gestartet")
+
     except Exception as e:
         print("❌ Fehler beim Telegram-Startup:", e)
         traceback.print_exc()
@@ -345,6 +366,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         tg_running = False
+        # sauber stoppen
         try:
             await tg_app.updater.stop()
         except Exception:
@@ -358,7 +380,6 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
         print("🛑 Telegram POLLING gestoppt")
-
 # ========= FastAPI App =========
 app = FastAPI(title="TQQQ Strategy + Telegram", lifespan=lifespan)
 
