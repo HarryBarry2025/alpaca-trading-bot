@@ -121,11 +121,12 @@ def fetch_stooq_daily(symbol: str, lookback_days: int) -> pd.DataFrame:
     except Exception as e:
         print("[stooq] fetch failed:", e)
         return pd.DataFrame()
-
 def fetch_alpaca_ohlcv(symbol: str, interval: str, lookback_days: int) -> pd.DataFrame:
     """
-    Intraday/Daily via Alpaca Market Data (benötigt gültige Alpaca-ENV).
-    Unterstützte Intervalle: '1Min','5Min','15Min','1Hour','1Day'.
+    Intraday/Daily via Alpaca Market Data v2.
+    WICHTIG:
+      - Data-Client braucht KEIN APCA_API_BASE_URL.
+      - feed='iex' erzwingen, sonst ggf. keine Daten ohne SIP-Abo.
     """
     try:
         from alpaca.data.historical import StockHistoricalDataClient
@@ -135,60 +136,58 @@ def fetch_alpaca_ohlcv(symbol: str, interval: str, lookback_days: int) -> pd.Dat
         print("[alpaca] library not available:", e)
         return pd.DataFrame()
 
-    if not (APCA_API_KEY_ID and APCA_API_SECRET_KEY and APCA_API_BASE_URL):
-        print("[alpaca] missing credentials/base url")
+    if not (APCA_API_KEY_ID and APCA_API_SECRET_KEY):
+        print("[alpaca] missing API key/secret")
         return pd.DataFrame()
 
-    # Map Interval
-    interval_map = {
-        "1m":"1Min","2m":"1Min","5m":"5Min","15m":"15Min","30m":"30Min",
-        "60m":"1Hour","90m":"1Hour","1h":"1Hour","1d":"1Day","1D":"1Day"
-    }
-    alp_tf = interval_map.get(interval, "1Hour")
-    if alp_tf == "30Min":
-        # Alpaca hat 30Min als 30Min nicht im Enum – wir approximieren mit 15Min & resample, hier wählen wir 15Min:
-        alp_tf = "15Min"
-
-    # TimeFrame Objekt
-    if alp_tf.endswith("Min"):
-        unit = TimeFrameUnit.Minute
-        mult = int(alp_tf.replace("Min",""))
-    elif alp_tf == "1Hour":
-        unit = TimeFrameUnit.Hour; mult = 1
+    # Interval-Mapping auf TimeFrame
+    interval = interval.lower()
+    if interval in {"1h","60m"}:
+        tf = TimeFrame(1, TimeFrameUnit.Hour)
+    elif interval in {"1d","1day"}:
+        tf = TimeFrame(1, TimeFrameUnit.Day)
+    elif interval in {"15m"}:
+        tf = TimeFrame(15, TimeFrameUnit.Minute)
+    elif interval in {"5m"}:
+        tf = TimeFrame(5, TimeFrameUnit.Minute)
     else:
-        unit = TimeFrameUnit.Day; mult = 1
+        # Fallback: 1h
+        tf = TimeFrame(1, TimeFrameUnit.Hour)
 
     client = StockHistoricalDataClient(APCA_API_KEY_ID, APCA_API_SECRET_KEY)
 
-    end = datetime.now(timezone.utc)
+    end   = datetime.now(timezone.utc)
     start = end - timedelta(days=max(lookback_days, 30))
 
     req = StockBarsRequest(
         symbol_or_symbols=symbol,
-        timeframe=TimeFrame(mult, unit),
+        timeframe=tf,
         start=start,
         end=end,
-        adjustment=None
+        adjustment=None,    # oder 'split' wenn gewünscht
+        feed="iex",         # <- WICHTIG: Free/Paper kompatibel
+        limit=10000         # reicht locker für 1h über 1 Jahr
     )
+
     try:
         bars = client.get_stock_bars(req)
         if not bars or bars.df is None or bars.df.empty:
+            print("[alpaca] empty frame (prüfe feed/interval/zugang)")
             return pd.DataFrame()
         df = bars.df.copy()
-        # MultiIndex (symbol, timestamp) → wir ziehen Symbolebene ab:
+        # MultiIndex (symbol, timestamp) → Symbolebene abziehen
         if isinstance(df.index, pd.MultiIndex):
             try:
                 df = df.xs(symbol, level=0)
             except Exception:
                 pass
-        df = df.rename(columns={
-            "open":"open","high":"high","low":"low","close":"close","volume":"volume"
-        })
+        df = df.rename(columns={"open":"open","high":"high","low":"low","close":"close","volume":"volume"})
         if not isinstance(df.index, pd.DatetimeIndex):
             df.index = pd.to_datetime(df.index)
         df.index = df.index.tz_convert("UTC") if df.index.tz is not None else df.index.tz_localize("UTC")
         df = df.sort_index()
         df["time"] = df.index
+        # Auf die üblichen Spalten reduzieren
         return df[["open","high","low","close","volume","time"]]
     except Exception as e:
         print("[alpaca] fetch failed:", e)
