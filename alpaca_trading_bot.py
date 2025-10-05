@@ -40,7 +40,7 @@ class StratConfig(BaseModel):
 
     # Pine-like Inputs
     rsiLen: int = 12
-    rsiLow: float = 52.0
+    rsiLow: float = 0
     rsiHigh: float = 68.0
     rsiExit: float = 48.0
     macdFast: int = 8
@@ -49,8 +49,8 @@ class StratConfig(BaseModel):
     efiLen: int = 11
 
     # Risk
-    slPerc: float = 2.0
-    tpPerc: float = 4.0
+    slPerc: float = 1.0
+    tpPerc: float = 400.0
     allowSameBarExit: bool = False
     minBarsInTrade: int = 0
 
@@ -316,7 +316,7 @@ def bar_logic(df: pd.DataFrame, cfg: StratConfig, st: StratState) -> Dict[str, A
     rsi_falling = (last["rsi"] < prev["rsi"])
     efi_rising = (last["efi"] > prev["efi"])
 
-    entry_cond = (rsi_val > cfg.rsiLow) and (rsi_val < cfg.rsiHigh) and rsi_rising and efi_rising and macd_above
+    entry_cond = (rsi_val > cfg.rsiLow) and (rsi_val < cfg.rsiHigh) and rsi_rising and efi_rising
     exit_cond  = (rsi_val < cfg.rsiExit) and rsi_falling
 
     price = float(last["close"])
