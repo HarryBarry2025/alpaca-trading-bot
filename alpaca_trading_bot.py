@@ -1,5 +1,5 @@
 # alpaca_trading_bot.py
-import os, json, time, asyncio, traceback, math
+import os, json, time, asyncio, traceback
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, Tuple
 
@@ -27,30 +27,31 @@ DEFAULT_CHAT_ID = os.getenv("DEFAULT_CHAT_ID", "")  # optional
 if not BOT_TOKEN:
     raise RuntimeError("Set TELEGRAM_BOT_TOKEN env var")
 
-# Alpaca ENV (optional, nur wenn data_provider=alpaca genutzt wird)
+# Alpaca ENV (optional; benötigt für Positionsabfrage/Live-Trading)
 APCA_API_KEY_ID     = os.getenv("APCA_API_KEY_ID", "")
 APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY", "")
-APCA_API_BASE_URL   = os.getenv("APCA_API_BASE_URL", "")  # z.B. https://paper-api.alpaca.markets
-
-# Interner Timer per ENV aktivierbar
-USE_INTERNAL_TIMER = os.getenv("USE_INTERNAL_TIMER", "false").lower() in ("1","true","yes")
+APCA_API_BASE_URL   = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")  # Paper-Default
 
 # ========= Strategy Config / State =========
 class StratConfig(BaseModel):
+    # Basis
     symbol: str = "TQQQ"
-    interval: str = "1h"     # '1d' oder '1h' etc.
+    interval: str = "1h"     # '1d' oder '1h'
     lookback_days: int = 365
 
-    # Pine-like Inputs (MACD entfernt)
+    # Pine-like Inputs (MACD above entfernt -> nicht in Entry-Bedingung)
     rsiLen: int = 12
-    rsiLow: float = 0.0        # <— auf 0 gesetzt
+    rsiLow: float = 0.0      # auf Wunsch 0
     rsiHigh: float = 68.0
     rsiExit: float = 48.0
+    macdFast: int = 8
+    macdSlow: int = 21
+    macdSig: int = 11
     efiLen: int = 11
 
     # Risk
-    slPerc: float = 2.0
-    tpPerc: float = 4.0
+    slPerc: float = 1.0
+    tpPerc: float = 400.0
     allowSameBarExit: bool = False
     minBarsInTrade: int = 0
 
@@ -59,10 +60,19 @@ class StratConfig(BaseModel):
     live_enabled: bool = False
 
     # Data Engine
-    data_provider: str = "yahoo"          # "yahoo", "stooq_eod", "alpaca"
+    data_provider: str = "alpaca"          # "yahoo", "stooq_eod", "alpaca"
     yahoo_retries: int = 3
     yahoo_backoff_sec: float = 2.0
-    allow_stooq_fallback: bool = True     # bei Yahoo-Fehler auf Stooq (daily) fallen?
+    allow_stooq_fallback: bool = True     # Fallback auf Stooq (daily)
+
+    # Trading-Flags (für spätere Live-Orders / Positionsanzeige)
+    trade_live: bool = False               # wenn True, broker calls erlaubt
+    tif: str = "day"                       # 'day' | 'gtc' etc. (für spätere Order-Nutzung)
+    use_extended_hours: bool = False
+    size_mode: str = "shares"              # 'shares' | 'percent'
+    shares: int = 1
+    percent_equity: float = 100.0
+    max_position_value: float = 500000.0
 
 class StratState(BaseModel):
     position_size: int = 0
@@ -87,6 +97,14 @@ def rsi(s: pd.Series, n: int = 14) -> pd.Series:
     roll_down = down.ewm(span=n, adjust=False).mean()
     rs = roll_up / (roll_down + 1e-12)
     return 100 - (100/(1+rs))
+
+def macd(s: pd.Series, fast: int, slow: int, sig: int):
+    fast_ema = ema(s, fast)
+    slow_ema = ema(s, slow)
+    line = fast_ema - slow_ema
+    signal = ema(line, sig)
+    hist = line - signal
+    return line, signal, hist
 
 def efi_func(close: pd.Series, vol: pd.Series, efi_len: int) -> pd.Series:
     raw = vol * (close - close.shift(1))
@@ -135,7 +153,7 @@ def fetch_alpaca_ohlcv(symbol: str, interval: str, lookback_days: int) -> pd.Dat
         tf = TimeFrame(1, TimeFrameUnit.Hour)
     elif interval in {"1d","1day"}:
         tf = TimeFrame(1, TimeFrameUnit.Day)
-    elif interval in {"15m", "15min"}:
+    elif interval in {"15m"}:
         tf = TimeFrame(15, TimeFrameUnit.Minute)
     elif interval in {"5m"}:
         tf = TimeFrame(5, TimeFrameUnit.Minute)
@@ -143,7 +161,6 @@ def fetch_alpaca_ohlcv(symbol: str, interval: str, lookback_days: int) -> pd.Dat
         tf = TimeFrame(1, TimeFrameUnit.Hour)
 
     client = StockHistoricalDataClient(APCA_API_KEY_ID, APCA_API_SECRET_KEY)
-
     end   = datetime.now(timezone.utc)
     start = end - timedelta(days=max(lookback_days, 30))
 
@@ -168,13 +185,12 @@ def fetch_alpaca_ohlcv(symbol: str, interval: str, lookback_days: int) -> pd.Dat
                 df = df.xs(symbol, level=0)
             except Exception:
                 pass
+        df = df.rename(columns={"open":"open","high":"high","low":"low","close":"close","volume":"volume"})
         if not isinstance(df.index, pd.DatetimeIndex):
             df.index = pd.to_datetime(df.index)
         df.index = df.index.tz_convert("UTC") if df.index.tz is not None else df.index.tz_localize("UTC")
         df = df.sort_index()
         df["time"] = df.index
-        df = df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
-        df.columns = [c.lower() for c in df.columns]
         return df[["open","high","low","close","volume","time"]]
     except Exception as e:
         print("[alpaca] fetch failed:", e)
@@ -182,12 +198,15 @@ def fetch_alpaca_ohlcv(symbol: str, interval: str, lookback_days: int) -> pd.Dat
 
 def fetch_ohlcv_with_note(symbol: str, interval: str, lookback_days: int) -> Tuple[pd.DataFrame, Dict[str,str]]:
     """
-    Robuster Download mit Fallbacks.
+    Robuster Download:
+      - Provider == yahoo (Intraday via period, Retries, fallback 1d, optional Stooq)
+      - Provider == stooq_eod (Daily)
+      - Provider == alpaca (Market Data IEX)
     """
     note = {"provider":"","detail":""}
-    intraday_set = {"1m","2m","5m","15m","15min","30m","60m","90m","1h"}
+    intraday_set = {"1m","2m","5m","15m","30m","60m","90m","1h"}
 
-    # Alpaca-Provider
+    # Alpaca
     if CONFIG.data_provider.lower() == "alpaca":
         df = fetch_alpaca_ohlcv(symbol, interval, lookback_days)
         if not df.empty:
@@ -195,7 +214,7 @@ def fetch_ohlcv_with_note(symbol: str, interval: str, lookback_days: int) -> Tup
             return df, note
         note.update(provider="Alpaca→Yahoo", detail="Alpaca leer; versuche Yahoo")
 
-    # Stooq-Provider (EOD)
+    # Stooq
     if CONFIG.data_provider.lower() == "stooq_eod":
         df = fetch_stooq_daily(symbol, lookback_days)
         if not df.empty:
@@ -203,7 +222,7 @@ def fetch_ohlcv_with_note(symbol: str, interval: str, lookback_days: int) -> Tup
             return df, note
         note.update(provider="Stooq→Yahoo", detail="Stooq leer; versuche Yahoo")
 
-    # Yahoo-Provider
+    # Yahoo
     is_intraday = interval in intraday_set
     period = f"{min(lookback_days, 730)}d" if is_intraday else f"{lookback_days}d"
 
@@ -271,16 +290,18 @@ def fetch_ohlcv_with_note(symbol: str, interval: str, lookback_days: int) -> Tup
     print(f"[fetch_ohlcv] keine Daten für {symbol} ({interval}, period={period}). Last error: {last_err}")
     return pd.DataFrame(), {"provider":"(leer)", "detail":"keine Daten"}
 
-# ========= Feature-Builder (ohne MACD) =========
+# ========= Feature-Builder =========
 def build_features(df: pd.DataFrame, cfg: StratConfig) -> pd.DataFrame:
     out = df.copy()
     out["rsi"] = rsi(out["close"], cfg.rsiLen)
+    macd_line, macd_sig, _ = macd(out["close"], cfg.macdFast, cfg.macdSlow, cfg.macdSig)
+    out["macd_line"], out["macd_sig"] = macd_line, macd_sig
     out["efi"] = efi_func(out["close"], out["volume"], cfg.efiLen)
     return out
 
-# ========= Strategy Logic (ohne MACD) =========
+# ========= Strategy Logic =========
 def bar_logic(df: pd.DataFrame, cfg: StratConfig, st: StratState) -> Dict[str, Any]:
-    if df.empty or len(df) < max(cfg.rsiLen, cfg.efiLen) + 3:
+    if df.empty or len(df) < max(cfg.rsiLen, cfg.macdSlow, cfg.efiLen) + 3:
         return {"action": "none", "reason": "not_enough_data"}
 
     last = df.iloc[-1]
@@ -291,9 +312,8 @@ def bar_logic(df: pd.DataFrame, cfg: StratConfig, st: StratState) -> Dict[str, A
     rsi_falling = (last["rsi"] < prev["rsi"])
     efi_rising  = (last["efi"] > prev["efi"])
 
-    # Entry: RSI im Band + RSI steigend + EFI steigend
+    # Entry (ohne MACD above)
     entry_cond = (rsi_val > cfg.rsiLow) and (rsi_val < cfg.rsiHigh) and rsi_rising and efi_rising
-    # Exit: RSI < Exit & fallend
     exit_cond  = (rsi_val < cfg.rsiExit) and rsi_falling
 
     price = float(last["close"])
@@ -311,14 +331,14 @@ def bar_logic(df: pd.DataFrame, cfg: StratConfig, st: StratState) -> Dict[str, A
 
     if st.position_size == 0:
         if entry_cond:
-            size = 1
+            size = 1  # lokale Simulationsgröße
             return {"action": "buy", "qty": size, "price": o, "time": str(ts), "reason": "rule_entry",
                     "sl": sl(o), "tp": tp(o)}
         else:
             return {"action": "none", "reason": "flat_no_entry"}
     else:
-        same_bar_ok = cfg.allowSameBarExit or (bars_in_trade > 0)
-        cooldown_ok = (bars_in_trade >= cfg.minBarsInTrade)
+        same_bar_ok = CONFIG.allowSameBarExit or (bars_in_trade > 0)
+        cooldown_ok = (bars_in_trade >= CONFIG.minBarsInTrade)
         rsi_exit_ok = exit_cond and same_bar_ok and cooldown_ok
 
         cur_sl = sl(st.avg_price)
@@ -335,6 +355,66 @@ def bar_logic(df: pd.DataFrame, cfg: StratConfig, st: StratState) -> Dict[str, A
             return {"action": "sell", "qty": st.position_size, "price": cur_tp, "time": str(ts), "reason": "take_profit"}
 
         return {"action": "none", "reason": "hold"}
+
+# ========= Alpaca Trading-Client (für Positionen) =========
+def alpaca_trading_client_or_none():
+    """Erzeugt bei vorhandenen Credentials einen TradingClient, sonst None."""
+    if not CONFIG.trade_live:
+        return None
+    try:
+        from alpaca.trading.client import TradingClient
+        use_paper = "paper" in APCA_API_BASE_URL
+        return TradingClient(APCA_API_KEY_ID, APCA_API_SECRET_KEY, paper=use_paper)
+    except Exception as e:
+        print("[alpaca] TradingClient Fehler:", e)
+        return None
+
+def alpaca_positions() -> Optional[list]:
+    """Offene Positionen von Alpaca oder None bei deaktiviertem Trading/Fehler."""
+    client = alpaca_trading_client_or_none()
+    if client is None:
+        return None
+    try:
+        return client.get_all_positions()
+    except Exception as e:
+        print("[alpaca] get_all_positions failed:", e)
+        return None
+
+def format_positions_text(positions: list) -> str:
+    if not positions:
+        return "📭 Keine offenen Alpaca-Positionen."
+    lines = ["📒 Alpaca Positionen:"]
+    total_mv = 0.0
+    total_upnl = 0.0
+    for p in positions:
+        try:
+            sym   = p.symbol
+            qty   = float(p.qty)
+            avg   = float(p.avg_entry_price)
+            mv    = float(p.market_value)
+            upnl  = float(p.unrealized_pl) if p.unrealized_pl is not None else 0.0
+            upnlp = float(p.unrealized_plpc)*100 if p.unrealized_plpc is not None else 0.0
+            curpx = float(getattr(p, "current_price", np.nan))
+            curpx_txt = f" px={curpx:.2f}" if np.isfinite(curpx) else ""
+            lines.append(
+                f"• {sym}  qty={qty:g}  avg={avg:.2f}{curpx_txt}  MV=${mv:,.2f}  UPL={upnl:+.2f} ({upnlp:+.2f}%)"
+            )
+            total_mv += mv
+            total_upnl += upnl
+        except Exception:
+            lines.append(f"• {getattr(p,'symbol','?')} qty={getattr(p,'qty','?')}")
+    lines.append(f"Σ MV=${total_mv:,.2f}  Σ UPL={total_upnl:+.2f}")
+    return "\n".join(lines)
+
+async def send_positions_summary(chat_id: str):
+    if not CONFIG.trade_live:
+        await send(chat_id, "ℹ️ Trading ist OFF. Keine Broker-Positionen abgefragt.")
+        return
+    pos = alpaca_positions()
+    if pos is None:
+        await send(chat_id, "❌ Konnte Alpaca-Positionen nicht laden (Credentials/Verbindung prüfen).")
+        return
+    await send(chat_id, format_positions_text(pos))
 
 # ========= Telegram helpers & handlers =========
 tg_app: Optional[Application] = None
@@ -359,21 +439,30 @@ async def cmd_start(update, context):
         "✅ Bot verbunden.\n"
         "Befehle:\n"
         "/status – zeigt Status\n"
-        "/set key=value … – z.B. /set rsiLow=0 rsiHigh=68 sl=2 tp=4\n"
+        "/set key=value … – z.B. /set rsiLow=0 rsiHigh=68 sl=1 tp=400\n"
         "/run – einen Live-Check jetzt ausführen\n"
         "/live on|off – Live-Loop schalten\n"
         "/cfg – aktuelle Konfiguration\n"
         "/bt 90 – Backtest über 90 Tage\n"
+        "/positions oder /pos – offene Alpaca-Positionen"
     )
 
 async def cmd_status(update, context):
+    open_pos_count = -1
+    if CONFIG.trade_live:
+        pos = alpaca_positions()
+        open_pos_count = len(pos) if pos is not None else -1
+
     await update.message.reply_text(
         f"📊 Status\n"
         f"Symbol: {CONFIG.symbol} {CONFIG.interval}\n"
         f"Live: {'ON' if CONFIG.live_enabled else 'OFF'} (alle {CONFIG.poll_minutes}m)\n"
-        f"Pos: {STATE.position_size} @ {STATE.avg_price:.4f} (seit {STATE.entry_time})\n"
-        f"Last: {STATE.last_status}\n"
-        f"Datenquelle: {CONFIG.data_provider}"
+        f"Pos(Local): {STATE.position_size} @ {STATE.avg_price:.4f} (seit {STATE.entry_time})\n"
+        + (f"Pos(Alpaca offen): {open_pos_count}\n" if CONFIG.trade_live else "")
+        + f"Last: {STATE.last_status}\n"
+        f"Datenquelle: {CONFIG.data_provider}\n"
+        f"Trading: {'ON' if CONFIG.trade_live else 'OFF'}  TIF={CONFIG.tif}  ExtHours={'ON' if CONFIG.use_extended_hours else 'OFF'}\n"
+        f"Sizing: {CONFIG.size_mode} | shares={CONFIG.shares} | %eq={CONFIG.percent_equity}% cap=${CONFIG.max_position_value}"
     )
 
 def set_from_kv(kv: str) -> str:
@@ -399,10 +488,10 @@ async def cmd_set(update, context):
         await update.message.reply_text(
             "Nutze: /set key=value [key=value] …\n"
             "Beispiele:\n"
-            "/set rsiLow=0 rsiHigh=68 sl=2 tp=4\n"
+            "/set rsiLow=0 rsiHigh=68 sl=1 tp=400\n"
             "/set interval=1h lookback_days=365\n"
             "/set data_provider=yahoo allow_stooq_fallback=true\n"
-            "/set data_provider=alpaca   # benötigt Alpaca ENV"
+            "/set data_provider=alpaca trade_live=true   # benötigt Alpaca ENV"
         )
         return
 
@@ -428,7 +517,7 @@ async def cmd_set(update, context):
         out = [
             "❌ Keine gültigen key=value-Paare erkannt.",
             "Beispiele:",
-            "/set rsiLow=0 rsiHigh=68 sl=2 tp=4",
+            "/set rsiLow=0 rsiHigh=68 sl=1 tp=400",
             "/set interval=1h lookback_days=365",
         ]
     await update.message.reply_text("\n".join(out).strip())
@@ -464,9 +553,8 @@ async def run_once_and_report(chat_id: str):
                             f"Quelle: {note.get('provider','?')} – {note.get('detail','')}")
         return
 
-    # Hinweis zur Datenlage (nur wenn Fallback/Alpaca/Stooq oder Provider ≠ yahoo)
     note_msg = _friendly_data_note(note)
-    if note_msg and ( "Fallback" in note_msg or "Stooq" in note_msg or "Alpaca" in note_msg or CONFIG.data_provider!="yahoo"):
+    if note_msg and ("Fallback" in note_msg or "Stooq" in note_msg or "Alpaca" in note_msg or CONFIG.data_provider!="yahoo"):
         await send(chat_id, note_msg)
 
     fdf = build_features(df, CONFIG)
@@ -478,6 +566,10 @@ async def run_once_and_report(chat_id: str):
         STATE.avg_price = float(act["price"])
         STATE.entry_time = act["time"]
         await send(chat_id, f"🟢 LONG @ {STATE.avg_price:.4f} ({CONFIG.symbol})\nSL={act['sl']:.4f}  TP={act['tp']:.4f}")
+        # Optional: aktuelle Alpaca-Positionen danach schicken
+        if CONFIG.trade_live:
+            await send_positions_summary(chat_id)
+
     elif act["action"] == "sell" and STATE.position_size > 0:
         exit_px = float(act["price"])
         pnl = (exit_px - STATE.avg_price) / STATE.avg_price
@@ -485,6 +577,8 @@ async def run_once_and_report(chat_id: str):
         STATE.position_size = 0
         STATE.avg_price = 0.0
         STATE.entry_time = None
+        if CONFIG.trade_live:
+            await send_positions_summary(chat_id)
     else:
         await send(chat_id, f"ℹ️ {STATE.last_status}")
 
@@ -507,16 +601,22 @@ async def cmd_bt(update, context):
 
     fdf = build_features(df, CONFIG)
 
-    # simpler EoB-Backtest (ohne MACD)
+    # simpler EoB-Backtest
     pos=0; avg=0.0; eq=1.0; R=[]; entries=exits=0
     for i in range(2, len(fdf)):
-        row, prev = fdf.iloc[i], fdf.iloc[i-1]
+        row, prev = fdf.iloc[i], fdf.iloc i-1
+        # (fix) correct prev reference
+    # ---- fix prev reference properly ----
+    R=[]; pos=0; avg=0.0; eq=1.0; entries=exits=0
+    for i in range(2, len(fdf)):
+        row = fdf.iloc[i]
+        prev = fdf.iloc[i-1]
         rsi_val = row["rsi"]
         rsi_rising = row["rsi"] > prev["rsi"]
         rsi_falling = row["rsi"] < prev["rsi"]
         efi_rising  = row["efi"] > prev["efi"]
-        entry = (rsi_val > CONFIG.rsiLow) and (rsi_val < CONFIG.rsiHigh) and rsi_rising and efi_rising
-        exitc = (rsi_val < CONFIG.rsiExit) and rsi_falling
+        entry = (rsi_val>CONFIG.rsiLow) and (rsi_val<CONFIG.rsiHigh) and rsi_rising and efi_rising
+        exitc = (rsi_val<CONFIG.rsiExit) and rsi_falling
         if pos==0 and entry:
             pos=1; avg=float(row["open"]); entries+=1
         elif pos==1:
@@ -533,83 +633,24 @@ async def cmd_bt(update, context):
         pf = (a[a>0].sum()) / (1e-9 + -a[a<0].sum() if (a<0).any() else 1e-9)
         cagr = (eq**(365/max(1,days)) - 1)
         await update.message.reply_text(
-            f"📈 Backtest {days}d\nTrades: {entries}/{exits} (open trades nicht gezählt)\n"
+            f"📈 Backtest {days}d\nTrades: {entries}/{exits}\n"
             f"WinRate={win*100:.1f}%  PF={pf:.2f}  CAGR~{cagr*100:.2f}%"
         )
     else:
         await update.message.reply_text("📉 Backtest: keine abgeschlossenen Trades.")
 
+async def cmd_positions(update, context):
+    await send_positions_summary(str(update.effective_chat.id))
+
 async def on_message(update, context):
     await update.message.reply_text("Unbekannter Befehl. /start für Hilfe")
 
-# ========= Timer-Helpers & Status =========
-LAST_TICK_AT: Optional[str] = None   # ISO-UTC des letzten erfolgreichen Runs
-NEXT_TICK_AT: Optional[str] = None   # ISO-UTC des nächsten geplanten Runs
-
-def now_utc():
-    return datetime.now(timezone.utc)
-
-def iso(dt: Optional[datetime]) -> Optional[str]:
-    return dt.isoformat().replace("+00:00", "Z") if isinstance(dt, datetime) else None
-
-async def sleep_until_next_step(minutes: int) -> float:
-    """Schläft bis zum nächsten 'minutes'-Raster (z. B. 10, 20, 30, …) und gibt die Wartezeit (Sek.) zurück."""
-    if minutes <= 0:
-        await asyncio.sleep(60)
-        return 60.0
-    now = now_utc()
-    total_sec = now.minute * 60 + now.second
-    step_sec = minutes * 60
-    wait = step_sec - (total_sec % step_sec)
-    if wait < 5:
-        wait += step_sec
-    await asyncio.sleep(wait)
-    return float(wait)
-
-def is_rth_now_utc() -> bool:
-    """Grobe US-RTH: Mo–Fr 13:30–20:00 UTC (keine Feiertage in dieser Minimal-Variante)."""
-    now = now_utc()
-    wd = now.weekday()  # 0=Mo … 6=So
-    if wd > 4:
-        return False
-    hhmm = now.hour * 100 + now.minute
-    return 1330 <= hhmm <= 2000
-
-_timer_task: Optional[asyncio.Task] = None
-_timer_running = False
-
-async def timer_loop():
-    """Interner Background-Timer, optional aktivierbar via USE_INTERNAL_TIMER."""
-    global _timer_running, LAST_TICK_AT, NEXT_TICK_AT
-    _timer_running = True
-    print(f"⏱️ Internal timer started (every {CONFIG.poll_minutes} min)")
-    try:
-        # ersten geplanten Zeitpunkt (nur Anzeige) und initiale Rasterausrichtung
-        NEXT_TICK_AT = iso(now_utc() + timedelta(minutes=CONFIG.poll_minutes))
-        await sleep_until_next_step(CONFIG.poll_minutes)
-
-        while _timer_running:
-            try:
-                # Anzeige nächster Planlauf
-                NEXT_TICK_AT = iso(now_utc() + timedelta(minutes=CONFIG.poll_minutes))
-
-                if CONFIG.live_enabled and (CHAT_ID is not None) and is_rth_now_utc():
-                    await run_once_and_report(CHAT_ID)
-                    LAST_TICK_AT = iso(now_utc())
-                # zum nächsten Slot schlafen
-                await sleep_until_next_step(CONFIG.poll_minutes)
-            except Exception as e:
-                print("timer_loop inner error:", e)
-                await asyncio.sleep(5)
-    finally:
-        print("⏹️ Internal timer stopped")
-
-# ========= Lifespan (Polling, PTB 20.7) =========
+# ========= Lifespan (Polling, PTB 20.7, ohne Loop-Konflikte) =========
 from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global tg_app, tg_running, POLLING_STARTED, _timer_task, _timer_running
+    global tg_app, tg_running, POLLING_STARTED
     try:
         tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -620,12 +661,14 @@ async def lifespan(app: FastAPI):
         tg_app.add_handler(CommandHandler("run",     cmd_run))
         tg_app.add_handler(CommandHandler("live",    cmd_live))
         tg_app.add_handler(CommandHandler("bt",      cmd_bt))
+        tg_app.add_handler(CommandHandler("positions", cmd_positions))
+        tg_app.add_handler(CommandHandler("pos",       cmd_positions))
         tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
         await tg_app.initialize()
         await tg_app.start()
 
-        # sicherstellen, dass kein Webhook aktiv ist
+        # Sicherstellen, dass KEIN Webhook aktiv ist, alte Updates verwerfen
         try:
             await tg_app.bot.delete_webhook(drop_pending_updates=True)
             print("ℹ️ Webhook gelöscht (drop_pending_updates=True)")
@@ -653,10 +696,6 @@ async def lifespan(app: FastAPI):
                     traceback.print_exc()
                     await asyncio.sleep(10)
 
-        # >>> internen Timer optional starten
-        if USE_INTERNAL_TIMER and _timer_task is None:
-            _timer_task = asyncio.create_task(timer_loop())
-
         tg_running = True
         print("🚀 Telegram POLLING aktiv")
     except Exception as e:
@@ -667,20 +706,6 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         tg_running = False
-
-        # Timer sauber beenden
-        try:
-            _timer_running = False
-            if _timer_task:
-                _timer_task.cancel()
-                try:
-                    await _timer_task
-                except asyncio.CancelledError:
-                    pass
-            _timer_task = None
-        except Exception:
-            pass
-
         try:
             await tg_app.updater.stop()
         except Exception:
@@ -708,7 +733,7 @@ async def root():
         "symbol": CONFIG.symbol,
         "interval": CONFIG.interval,
         "provider": CONFIG.data_provider,
-        "internal_timer": USE_INTERNAL_TIMER
+        "trade_live": CONFIG.trade_live
     }
 
 @app.head("/")
@@ -741,7 +766,6 @@ def envcheck():
         "APCA_API_KEY_ID": chk("APCA_API_KEY_ID"),
         "APCA_API_SECRET_KEY": chk("APCA_API_SECRET_KEY"),
         "APCA_API_BASE_URL": chk("APCA_API_BASE_URL"),
-        "USE_INTERNAL_TIMER": chk("USE_INTERNAL_TIMER"),
     }
 
 @app.get("/tgstatus")
@@ -749,21 +773,6 @@ def tgstatus():
     return {
         "tg_running": tg_running,
         "polling_started": POLLING_STARTED
-    }
-
-# Timer-Status-Endpoint
-@app.get("/timer")
-def timer_status():
-    return {
-        "internal_timer_enabled": USE_INTERNAL_TIMER,
-        "poll_minutes": CONFIG.poll_minutes,
-        "tg_running": tg_running,
-        "polling_started": POLLING_STARTED,
-        "live_enabled": CONFIG.live_enabled,
-        "chat_id_present": CHAT_ID is not None,
-        "rth_now": is_rth_now_utc(),
-        "last_tick_at": LAST_TICK_AT,
-        "next_tick_at": NEXT_TICK_AT,
     }
 
 # Optional: Webhook-Route (nicht genutzt im Polling-Modus)
