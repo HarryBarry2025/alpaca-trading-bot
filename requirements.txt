@@ -3,10 +3,7 @@ uvicorn[standard]==0.30.6
 python-telegram-bot==20.7
 pandas==2.2.2
 numpy==1.26.4
-
-# Marktdaten/Indikatoren – falls im Code genutzt:
 yfinance==0.2.43
-ta==0.11.0
-
-# Alpaca
 alpaca-py==0.25.0
+matplotlib==3.8.4
+holidays==0.56        # optional; falls nicht da, Feiertage=aus
