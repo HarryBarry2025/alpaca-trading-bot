@@ -32,16 +32,17 @@ if not BOT_TOKEN:
 # Alpaca (Paper)
 APCA_API_KEY_ID     = os.getenv("APCA_API_KEY_ID", "")
 APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY", "")
+
 # trading toggle & timer from env
-ENV_ENABLE_TRADE     = os.getenv("ENABLE_TRADE", "false").lower() in ("1","true","on","yes")
-ENV_ENABLE_TIMER     = os.getenv("ENABLE_TIMER", "false").lower() in ("1","true","on","yes")
-ENV_POLL_MINUTES     = int(os.getenv("POLL_MINUTES", "10"))
-ENV_MARKET_HOURS_ONLY= os.getenv("MARKET_HOURS_ONLY", "true").lower() in ("1","true","on","yes")
+ENV_ENABLE_TRADE      = os.getenv("ENABLE_TRADE", "false").lower() in ("1","true","on","yes")
+ENV_ENABLE_TIMER      = os.getenv("ENABLE_TIMER", "false").lower() in ("1","true","on","yes")
+ENV_POLL_MINUTES      = int(os.getenv("POLL_MINUTES", "10"))
+ENV_MARKET_HOURS_ONLY = os.getenv("MARKET_HOURS_ONLY", "true").lower() in ("1","true","on","yes")
 
 # ========= Strategy Config / State =========
 class StratConfig(BaseModel):
     # Engine
-    symbols: List[str] = ["TQQQ"]          # Multi-Asset (erste wird für /dump default genutzt)
+    symbols: List[str] = ["TQQQ"]          # Multi-Asset
     interval: str = "1h"                   # '1h' oder '1d'
     lookback_days: int = 365
 
@@ -101,25 +102,19 @@ def efi_tv(close: pd.Series, vol: pd.Series, length: int) -> pd.Series:
     return ema(raw, length)
 
 # ========= US Market Hours + Holidays =========
-NYSE_TZ = timezone(timedelta(hours=-4))  # EDT (vereinfachend; keine DST-Umrechnung hier)
 def is_market_open_now(dt_utc: Optional[datetime] = None) -> bool:
-    # robust: nutze UTC und prüfe US Eastern grob (Mo-Fr, 13:30–20:00 UTC als Näherung)
+    # Grobe Kernhandelszeit (13:30–20:00 UTC ~ 9:30–16:00 ET), Mo–Fr + ein paar US-Feiertage:
     now = dt_utc or datetime.now(timezone.utc)
-    # Feiertage (kleines Set; optional erweitern)
     us_holidays = {
-        # 2025 (Beispiele)
+        # 2025
         "2025-01-01","2025-01-20","2025-02-17","2025-04-18","2025-05-26",
         "2025-06-19","2025-07-04","2025-09-01","2025-11-27","2025-12-25",
-        # 2024 (historisch)
+        # 2024
         "2024-01-01","2024-01-15","2024-02-19","2024-03-29","2024-05-27",
         "2024-06-19","2024-07-04","2024-09-02","2024-11-28","2024-12-25",
     }
-    if now.strftime("%Y-%m-%d") in us_holidays:
-        return False
-    # Mo–Fr
-    if now.weekday() >= 5:
-        return False
-    # grobe Kernhandelszeit (13:30–20:00 UTC ~ 9:30–16:00 ET)
+    if now.strftime("%Y-%m-%d") in us_holidays: return False
+    if now.weekday() >= 5: return False
     hhmm = now.hour*60 + now.minute
     return 13*60+30 <= hhmm <= 20*60
 
@@ -294,90 +289,7 @@ def build_export_frame(df: pd.DataFrame, cfg: StratConfig) -> pd.DataFrame:
     cols = ["open","high","low","close","volume","rsi","efi","rsi_rising","efi_rising","entry_cond","exit_cond","time"]
     return f[cols]
 
-# ========= Strategy step (per Symbol) =========
-def bar_logic_last(df: pd.DataFrame, cfg: StratConfig, sym: str) -> Dict[str,Any]:
-    if df.empty or len(df) < max(cfg.rsiLen, cfg.efiLen) + 3:
-        return {"action":"none","reason":"not_enough_data","symbol":sym}
-
-    f = compute_signals_for_frame(df, cfg)
-    last, prev = f.iloc[-1], f.iloc[-2]
-
-    price_close = float(last["close"])
-    price_open  = float(last["open"])
-    ts = last["time"]
-
-    entry_cond = bool(last["entry_cond"])
-    exit_cond  = bool(last["exit_cond"])
-
-    pos = STATE.positions.get(sym, {"size":0,"avg":0.0,"entry_time":None})
-    size = pos["size"]; avg = pos["avg"]; entry_time = pos["entry_time"]
-
-    def sl(p): return p*(1-cfg.slPerc/100.0)
-    def tp(p): return p*(1+cfg.tpPerc/100.0)
-
-    # bars since entry (EOB approx)
-    bars_in_trade=0
-    if entry_time is not None:
-        since = df[df["time"] >= pd.to_datetime(entry_time, utc=True)]
-        bars_in_trade = max(0, len(since)-1)
-
-    if size==0:
-        if entry_cond:
-            q = 1  # Demo: fixe Größe; sizing kann /set … steuern, falls erweitert
-            return {"action":"buy","symbol":sym,"qty":q,"px":price_open,"time":str(ts),
-                    "sl":sl(price_open),"tp":tp(price_open),"reason":"rule_entry",
-                    "rsi":float(last["rsi"]), "efi":float(last["efi"])}
-        return {"action":"none","symbol":sym,"reason":"flat_no_entry",
-                "rsi":float(last["rsi"]), "efi":float(last["efi"])}
-    else:
-        same_bar_ok = cfg.allowSameBarExit or (bars_in_trade>0)
-        cooldown_ok = (bars_in_trade>=cfg.minBarsInTrade)
-        rsi_exit_ok = exit_cond and same_bar_ok and cooldown_ok
-
-        cur_sl = sl(avg); cur_tp = tp(avg)
-        hit_sl = price_close <= cur_sl
-        hit_tp = price_close >= cur_tp
-
-        if rsi_exit_ok:
-            return {"action":"sell","symbol":sym,"qty":size,"px":price_open,"time":str(ts),"reason":"rsi_exit",
-                    "rsi":float(last["rsi"]), "efi":float(last["efi"])}
-        if hit_sl:
-            return {"action":"sell","symbol":sym,"qty":size,"px":cur_sl,"time":str(ts),"reason":"stop_loss",
-                    "rsi":float(last["rsi"]), "efi":float(last["efi"])}
-        if hit_tp:
-            return {"action":"sell","symbol":sym,"qty":size,"px":cur_tp,"time":str(ts),"reason":"take_profit",
-                    "rsi":float(last["rsi"]), "efi":float(last["efi"])}
-        return {"action":"none","symbol":sym,"reason":"hold",
-                "rsi":float(last["rsi"]), "efi":float(last["efi"])}
-
-# ========= Telegram helpers =========
-tg_app: Optional[Application] = None
-POLLING_STARTED = False
-
-async def send_text(chat_id: str, text: str):
-    if tg_app is None: return
-    if not text or not text.strip():
-        text = "ℹ️ (leer)"
-    try:
-        await tg_app.bot.send_message(chat_id=chat_id, text=text)
-    except Exception as e:
-        print("send_text error:", e)
-
-async def send_document_bytes(chat_id: str, data: bytes, filename: str, caption: str = ""):
-    if tg_app is None: return
-    try:
-        bio = io.BytesIO(data); bio.name = filename; bio.seek(0)
-        await tg_app.bot.send_document(chat_id=chat_id, document=InputFile(bio), caption=caption)
-    except Exception as e:
-        print("send_document error:", e)
-
-async def send_png(chat_id: str, fig, filename: str, caption: str = ""):
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight")
-    plt.close(fig)
-    await send_document_bytes(chat_id, buf.getvalue(), filename, caption)
-
-# ========= Trading via Alpaca (Paper) =========
+# ========= Alpaca Trading (Paper) =========
 def alpaca_trading_client():
     try:
         from alpaca.trading.client import TradingClient
@@ -446,7 +358,7 @@ def alpaca_account() -> Dict[str,Any]:
     except Exception as e:
         print("alpaca_account error:", e); return {}
 
-# ========= Single-step runner =========
+# ========= Single-step Runner =========
 def friendly_note(note: Dict[str,str]) -> str:
     prov = note.get("provider",""); det = note.get("detail","")
     if not prov: return ""
@@ -459,42 +371,120 @@ async def run_once_for_symbol(sym: str, send_signals: bool = True) -> Dict[str,A
     if df.empty:
         return {"ok":False, "msg": f"❌ Keine Daten für {sym}. {note}"}
 
-    act = bar_logic_last(df, CONFIG, sym)
+    # Signalberechnung & Entscheidung
+    f = compute_signals_for_frame(df, CONFIG)
+    last, prev = f.iloc[-1], f.iloc[-2]
+
+    price_close = float(last["close"])
+    price_open  = float(last["open"])
+    ts = last["time"]
+
+    entry_cond = bool(last["entry_cond"])
+    exit_cond  = bool(last["exit_cond"])
+
+    pos = STATE.positions.get(sym, {"size":0,"avg":0.0,"entry_time":None})
+    size = pos["size"]; avg = pos["avg"]; entry_time = pos["entry_time"]
+
+    def sl(p): return p*(1-CONFIG.slPerc/100.0)
+    def tp(p): return p*(1+CONFIG.tpPerc/100.0)
+
+    # bars since entry
+    bars_in_trade=0
+    if entry_time is not None:
+        since = df[df["time"] >= pd.to_datetime(entry_time, utc=True)]
+        bars_in_trade = max(0, len(since)-1)
+
+    # Build action
+    if size==0:
+        if entry_cond:
+            q = 1
+            act = {"action":"buy","symbol":sym,"qty":q,"px":price_open,"time":str(ts),
+                   "sl":sl(price_open),"tp":tp(price_open),"reason":"rule_entry",
+                   "rsi":float(last["rsi"]), "efi":float(last["efi"])}
+        else:
+            act = {"action":"none","symbol":sym,"reason":"flat_no_entry",
+                   "rsi":float(last["rsi"]), "efi":float(last["efi"])}
+    else:
+        same_bar_ok = CONFIG.allowSameBarExit or (bars_in_trade>0)
+        cooldown_ok = (bars_in_trade>=CONFIG.minBarsInTrade)
+        rsi_exit_ok = exit_cond and same_bar_ok and cooldown_ok
+        cur_sl = sl(avg); cur_tp = tp(avg)
+        hit_sl = price_close <= cur_sl
+        hit_tp = price_close >= cur_tp
+
+        if rsi_exit_ok:
+            act = {"action":"sell","symbol":sym,"qty":size,"px":price_open,"time":str(ts),"reason":"rsi_exit",
+                   "rsi":float(last["rsi"]), "efi":float(last["efi"])}
+        elif hit_sl:
+            act = {"action":"sell","symbol":sym,"qty":size,"px":cur_sl,"time":str(ts),"reason":"stop_loss",
+                   "rsi":float(last["rsi"]), "efi":float(last["efi"])}
+        elif hit_tp:
+            act = {"action":"sell","symbol":sym,"qty":size,"px":cur_tp,"time":str(ts),"reason":"take_profit",
+                   "rsi":float(last["rsi"]), "efi":float(last["efi"])}
+        else:
+            act = {"action":"none","symbol":sym,"reason":"hold",
+                   "rsi":float(last["rsi"]), "efi":float(last["efi"])}
+
     STATE.last_status = f"{sym}: {act['action']} ({act['reason']})"
 
-    # Meldungen
+    # Meldungen (alle 10 Min / bei run)
     if send_signals and CHAT_ID:
-        # Indikator-Status (alle 10 Min oder auf /run)
-        await send_text(CHAT_ID, f"ℹ️ {sym} {CONFIG.interval} rsi={act.get('rsi',np.nan):.2f} efi={act.get('efi',np.nan):.2f} • {act['reason']}")
+        await tg_send_text(CHAT_ID, f"ℹ️ {sym} {CONFIG.interval} rsi={act.get('rsi',np.nan):.2f} efi={act.get('efi',np.nan):.2f} • {act['reason']}")
         note_msg = friendly_note(note)
         if note_msg and ("Fallback" in note_msg or CONFIG.data_provider!="alpaca"):
-            await send_text(CHAT_ID, note_msg)
+            await tg_send_text(CHAT_ID, note_msg)
 
-    # Trading (Paper) – nur wenn freigegeben, Markt offen (optional) und Handlung nötig
+    # Trading (Paper)
     if CONFIG.trade_enabled and act["action"] in ("buy","sell"):
         if CONFIG.market_hours_only and not is_market_open_now():
             if CHAT_ID:
-                await send_text(CHAT_ID, "⛔ Markt geschlossen – kein Trade ausgeführt.")
+                await tg_send_text(CHAT_ID, "⛔ Markt geschlossen – kein Trade ausgeführt.")
         else:
             side = "buy" if act["action"]=="buy" else "sell"
             tif  = "day"
             info = await place_market_order(sym, int(act["qty"]), side, tif)
             if CHAT_ID:
-                await send_text(CHAT_ID, f"🛒 {side.upper()} {sym} x{act['qty']} @ {act['px']:.4f} • {info}")
+                await tg_send_text(CHAT_ID, f"🛒 {side.upper()} {sym} x{act['qty']} @ {act['px']:.4f} • {info}")
 
-    # Local Position-Emulation (zur Anzeige /status wenn Alpaca nicht genutzt)
+    # Lokale Sim-Positionen (falls Alpaca nicht genutzt/erreichbar)
     pos = STATE.positions.get(sym, {"size":0, "avg":0.0, "entry_time":None})
     if act["action"]=="buy" and pos["size"]==0:
         STATE.positions[sym] = {"size":act["qty"],"avg":act["px"],"entry_time":act["time"]}
         if CHAT_ID and send_signals:
-            await send_text(CHAT_ID, f"🟢 LONG (sim) {sym} @ {act['px']:.4f} | SL={act.get('sl',np.nan):.4f} TP={act.get('tp',np.nan):.4f}")
+            await tg_send_text(CHAT_ID, f"🟢 LONG (sim) {sym} @ {act['px']:.4f} | SL={act.get('sl',np.nan):.4f} TP={act.get('tp',np.nan):.4f}")
     elif act["action"]=="sell" and pos["size"]>0:
         pnl = (act["px"] - pos["avg"]) / pos["avg"]
         STATE.positions[sym] = {"size":0,"avg":0.0,"entry_time":None}
         if CHAT_ID and send_signals:
-            await send_text(CHAT_ID, f"🔴 EXIT (sim) {sym} @ {act['px']:.4f} • {act['reason']} • PnL={pnl*100:.2f}%")
+            await tg_send_text(CHAT_ID, f"🔴 EXIT (sim) {sym} @ {act['px']:.4f} • {act['reason']} • PnL={pnl*100:.2f}%")
 
     return {"ok":True,"act":act}
+
+# ========= Telegram helpers =========
+tg_app: Optional[Application] = None
+POLLING_STARTED = False
+
+async def tg_send_text(chat_id: str, text: str):
+    if tg_app is None: return
+    if not text or not text.strip(): text = "ℹ️ (leer)"
+    try:
+        await tg_app.bot.send_message(chat_id=chat_id, text=text)
+    except Exception as e:
+        print("send_text error:", e)
+
+async def send_document_bytes(chat_id: str, data: bytes, filename: str, caption: str = ""):
+    if tg_app is None: return
+    try:
+        bio = io.BytesIO(data); bio.name = filename; bio.seek(0)
+        await tg_app.bot.send_document(chat_id=chat_id, document=InputFile(bio), caption=caption)
+    except Exception as e:
+        print("send_document error:", e)
+
+async def send_png(chat_id: str, fig, filename: str, caption: str = ""):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    await send_document_bytes(chat_id, buf.getvalue(), filename, caption)
 
 # ========= Background Timer =========
 TIMER = {
@@ -505,6 +495,7 @@ TIMER = {
     "next_due": None,
     "market_hours_only": CONFIG.market_hours_only
 }
+TIMER_TASK: Optional[asyncio.Task] = None
 
 async def timer_loop():
     TIMER["running"] = True
@@ -514,21 +505,29 @@ async def timer_loop():
             # Market hours filter
             if TIMER["market_hours_only"] and not is_market_open_now(now):
                 TIMER["next_due"] = None
-                await asyncio.sleep(60)  # 1 Min warten
+                await asyncio.sleep(30)  # 30s warten, dann erneut prüfen
                 continue
 
             # due?
-            if TIMER["last_run"] is None or (TIMER["next_due"] and now >= TIMER["next_due"]):
-                # multi-asset loop
+            due = False
+            if TIMER["last_run"] is None:
+                due = True
+            elif TIMER["next_due"]:
+                try:
+                    nd = datetime.fromisoformat(TIMER["next_due"])
+                    due = now >= nd
+                except Exception:
+                    due = True
+
+            if due:
                 for sym in CONFIG.symbols:
                     await run_once_for_symbol(sym, send_signals=True)
                 TIMER["last_run"] = now.isoformat()
                 TIMER["next_due"] = (now + timedelta(minutes=TIMER["poll_minutes"])).isoformat()
-            await asyncio.sleep(10)
+
+            await asyncio.sleep(5)
     finally:
         TIMER["running"] = False
-
-TIMER_TASK: Optional[asyncio.Task] = None
 
 # ========= Telegram Commands =========
 async def cmd_start(update, context):
@@ -549,7 +548,6 @@ async def cmd_status(update, context):
     for s,p in STATE.positions.items():
         pos_lines.append(f"{s}: size={p['size']} avg={p['avg']:.4f} since={p['entry_time']}")
     pos_txt = "\n".join(pos_lines) if pos_lines else "keine (sim)"
-
     await update.message.reply_text(
         "📊 Status\n"
         f"Symbols: {', '.join(CONFIG.symbols)}  TF={CONFIG.interval}\n"
@@ -587,7 +585,7 @@ async def cmd_set(update, context):
             "Beispiele:\n"
             "/set rsiLow=0 rsiHigh=68 rsiExit=48 sl=1 tp=4\n"
             "/set interval=1h lookback_days=365\n"
-            "/set symbols=TQQQ,QQQ SPY\n"
+            "/set symbols=TQQQ,QQQ,SPY\n"
             "/set data_provider=alpaca\n"
             "/set poll_minutes=10 market_hours_only=true\n"
         ); return
@@ -676,8 +674,7 @@ async def cmd_sig(update, context):
         f"🔎 {sym} {CONFIG.interval}\n"
         f"rsi={last['rsi']:.2f} (rising={bool(last['rsi_rising'])})  "
         f"efi={last['efi']:.2f} (rising={bool(last['efi_rising'])})\n"
-        f"entry={bool(last['entry_cond'])}  exit={bool(last['exit_cond'])}\n"
-        f"{friendly_note({'provider':'(versteckt)','detail':''})}"
+        f"entry={bool(last['entry_cond'])}  exit={bool(last['exit_cond'])}"
     ).strip()
     await update.message.reply_text(txt)
 
@@ -696,18 +693,21 @@ async def cmd_plot(update, context):
     ax.plot(f.index, f["close"], label="Close")
     ax.set_title(f"{sym} {CONFIG.interval} Close")
     ax.grid(True); ax.legend(loc="best")
+
     fig2, ax2 = plt.subplots(figsize=(10,3))
     ax2.plot(f.index, f["rsi"], label="RSI")
     ax2.axhline(CONFIG.rsiLow, linestyle="--")
     ax2.axhline(CONFIG.rsiHigh, linestyle="--")
     ax2.set_title("RSI (Wilder)"); ax2.grid(True); ax2.legend(loc="best")
+
     fig3, ax3 = plt.subplots(figsize=(10,3))
     ax3.plot(f.index, f["efi"], label="EFI")
     ax3.set_title("EFI (EMA(vol*Δclose))"); ax3.grid(True); ax3.legend(loc="best")
 
-    await send_png(str(update.effective_chat.id), fig,  f"{sym}_{CONFIG.interval}_close.png", "📈 Close")
-    await send_png(str(update.effective_chat.id), fig2, f"{sym}_{CONFIG.interval}_rsi.png",   "📈 RSI")
-    await send_png(str(update.effective_chat.id), fig3, f"{sym}_{CONFIG.interval}_efi.png",   "📈 EFI")
+    cid = str(update.effective_chat.id)
+    await send_png(cid, fig,  f"{sym}_{CONFIG.interval}_close.png", "📈 Close")
+    await send_png(cid, fig2, f"{sym}_{CONFIG.interval}_rsi.png",   "📈 RSI")
+    await send_png(cid, fig3, f"{sym}_{CONFIG.interval}_efi.png",   "📈 EFI")
 
 async def cmd_dump(update, context):
     sym = CONFIG.symbols[0]
@@ -875,7 +875,8 @@ async def root():
             "enabled": TIMER["enabled"],
             "running": TIMER["running"],
             "poll_minutes": TIMER["poll_minutes"],
-            "next_due": TIMER["next_due"]
+            "next_due": TIMER["next_due"],
+            "last_run": TIMER["last_run"]
         },
         "trade_enabled": CONFIG.trade_enabled
     }
@@ -908,6 +909,37 @@ def envcheck():
 @app.get("/tgstatus")
 def tgstatus():
     return {"polling_started": POLLING_STARTED}
+
+# ---- NEU: HTTP-Endpoints zur Timer-Steuerung
+@app.get("/timerstatus")
+async def timerstatus_http():
+    return {
+        "enabled": TIMER["enabled"],
+        "running": TIMER["running"],
+        "poll_minutes": TIMER["poll_minutes"],
+        "last_run": TIMER["last_run"],
+        "next_due": TIMER["next_due"],
+        "market_hours_only": TIMER["market_hours_only"]
+    }
+
+@app.post("/timer/on")
+async def timer_on_http():
+    TIMER["enabled"] = True
+    return {"ok": True, "enabled": True}
+
+@app.post("/timer/off")
+async def timer_off_http():
+    TIMER["enabled"] = False
+    return {"ok": True, "enabled": False}
+
+@app.post("/timer/run-now")
+async def timer_run_now_http():
+    for sym in CONFIG.symbols:
+        await run_once_for_symbol(sym, send_signals=False)
+    now = datetime.now(timezone.utc)
+    TIMER["last_run"]=now.isoformat()
+    TIMER["next_due"]=(now + timedelta(minutes=TIMER["poll_minutes"])).isoformat()
+    return {"ok": True, "at": TIMER["last_run"]}
 
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
