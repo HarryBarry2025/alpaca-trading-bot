@@ -457,7 +457,8 @@ def alpaca_positions() -> List[Dict[str,Any]]:
 
 def alpaca_account() -> Dict[str,Any]:
     client = alpaca_trading_client()
-    if client is None: return {}
+    if client is None:
+        return {}
     try:
         acc = client.get_account()
         return {
@@ -465,10 +466,14 @@ def alpaca_account() -> Dict[str,Any]:
             "equity": float(acc.equity),
             "cash": float(acc.cash),
             "buying_power": float(acc.buying_power),
-            "multiplier": acc.multiplier
+            "multiplier": acc.multiplier,
+            "daytrade_count": acc.daytrade_count,
+            "pattern_day_trader": acc.pattern_day_trader,
+            "daytrading_buying_power": float(acc.daytrading_buying_power)
         }
     except Exception as e:
-        print("alpaca_account error:", e); return {}
+        print("alpaca_account error:", e)
+        return {}
 
 # ========= Helpers =========
 def friendly_note(note: Dict[str,str]) -> str:
