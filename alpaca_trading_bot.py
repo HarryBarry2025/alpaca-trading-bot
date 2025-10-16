@@ -312,6 +312,78 @@ def compute_signals_for_frame(df: pd.DataFrame, cfg: StratConfig) -> pd.DataFram
     f["exit_cond"]  = (f["rsi"] < cfg.rsiExit) & (~f["rsi_rising"])
     return f
 
+def backtest_conservative(df: pd.DataFrame, cfg,
+                          commission_per_share: float = 0.0005,   # z.B. $0.0005 / Anteil
+                          slippage_bps: float = 1.0):             # 1 bp = 0.01%
+    """
+    Konservativer EoB-Backtest:
+      - Signale vom VOR-Bar (i-1), Ausführung am Open des Bar i
+      - SL/TP gegen Intrabar High/Low
+      - Reihenfolge: SL -> TP -> Signal-Exit (konservativ)
+      - Slippage & Kommission werden berücksichtigt
+    Rückgabe: dict mit Winrate, PF, CAGR (aus Zeitraum), Trades, Equity
+    """
+    f = compute_signals_for_frame(df, cfg).copy()
+    if len(f) < 3:
+        return {"trades":"0/0", "equity":1.0, "winrate":0.0, "pf":0.0, "cagr":0.0}
+
+    pos=0; avg=0.0; eq=1.0; R=[]; entries=exits=0
+
+    # Testdauer (für CAGR)
+    start_dt = pd.to_datetime(f.index[0])
+    end_dt   = pd.to_datetime(f.index[-1])
+    days_span = max(1, (end_dt - start_dt).days)
+
+    for i in range(1, len(f)):
+        prev = f.iloc[i-1]                   # Signale immer vom abgeschlossenen Bar
+        o = float(f["open"].iloc[i])         # Ausführung am aktuellen Open
+        h = float(f["high"].iloc[i])
+        l = float(f["low"].iloc[i])
+        # c = float(f["close"].iloc[i])      # Close wird nicht für Trades genutzt
+
+        if pos == 0:
+            if bool(prev["entry_cond"]):
+                buy_px = o * (1 + slippage_bps/10000) + commission_per_share
+                pos = 1
+                avg = buy_px
+                entries += 1
+        else:
+            sl = avg * (1 - cfg.slPerc/100.0)
+            tp = avg * (1 + cfg.tpPerc/100.0)
+
+            # Konservative Reihenfolge: SL zuerst, dann TP, dann Signal-Exit
+            if l <= sl and h >= tp:
+                sell_px = sl * (1 - slippage_bps/10000) - commission_per_share
+                r = (sell_px - avg) / avg
+                eq *= (1 + r); R.append(r); exits += 1
+                pos = 0; avg = 0.0
+            elif l <= sl:
+                sell_px = sl * (1 - slippage_bps/10000) - commission_per_share
+                r = (sell_px - avg) / avg
+                eq *= (1 + r); R.append(r); exits += 1
+                pos = 0; avg = 0.0
+            elif h >= tp:
+                sell_px = tp * (1 - slippage_bps/10000) - commission_per_share
+                r = (sell_px - avg) / avg
+                eq *= (1 + r); R.append(r); exits += 1
+                pos = 0; avg = 0.0
+            elif bool(prev["exit_cond"]):
+                sell_px = o * (1 - slippage_bps/10000) - commission_per_share
+                r = (sell_px - avg) / avg
+                eq *= (1 + r); R.append(r); exits += 1
+                pos = 0; avg = 0.0
+
+    stats = {"trades": f"{entries}/{exits}", "equity": float(eq)}
+    if R:
+        a = np.array(R)
+        win = float((a > 0).mean())
+        pf  = float(a[a>0].sum() / (1e-9 + -a[a<0].sum() if (a<0).any() else 1e-9))
+        cagr = float((eq ** (365.0 / days_span)) - 1.0) if eq > 0 else 0.0
+        stats.update(winrate=win, pf=pf, cagr=cagr)
+    else:
+        stats.update(winrate=0.0, pf=0.0, cagr=0.0)
+    return stats
+
 def build_export_frame(df: pd.DataFrame, cfg: StratConfig) -> pd.DataFrame:
     f = compute_signals_for_frame(df, cfg)
     cols = ["open","high","low","close","volume","rsi","efi","rsi_rising","efi_rising","entry_cond","exit_cond","time"]
@@ -675,38 +747,39 @@ async def cmd_run(update, context):
         await run_once_for_symbol(sym, send_signals=True)
 
 async def cmd_bt(update, context):
-    days = 180
+    # Optional: Tage aus Argument übernehmen
+    days = None
     if context.args:
-        try: days = int(context.args[0])
-        except: pass
-    sym = CONFIG.symbols[0]
-    df, note = fetch_ohlcv_with_note(sym, CONFIG.interval, days)
-    if df.empty:
-        await update.message.reply_text(f"❌ Keine Daten für Backtest ({sym})."); return
-    f = compute_signals_for_frame(df, CONFIG)
-    pos=0; avg=0.0; eq=1.0; R=[]; entries=exits=0
-    for i in range(2,len(f)):
-        row, prev = f.iloc[i], f.iloc[i-1]
-        entry = bool(row["entry_cond"])
-        exitc = bool(row["exit_cond"])
-        if pos==0 and entry:
-            pos=1; avg=float(row["open"]); entries+=1
-        elif pos==1:
-            sl = avg*(1-CONFIG.slPerc/100); tp = avg*(1+CONFIG.tpPerc/100)
-            price = float(row["close"])
-            stop = price<=sl; take=price>=tp
-            if exitc or stop or take:
-                px = sl if stop else tp if take else float(row["open"])
-                r = (px-avg)/avg
-                eq*= (1+r); R.append(r); exits+=1
-                pos=0; avg=0.0
-    if R:
-        a=np.array(R); win=(a>0).mean(); pf=a[a>0].sum()/(1e-9 + -a[a<0].sum() if (a<0).any() else 1e-9)
-        cagr=(eq**(365/max(1,days))-1)
-        await update.message.reply_text(f"📈 Backtest {days}d  Trades={entries}/{exits}  Win={win*100:.1f}%  PF={pf:.2f}  CAGR~{cagr*100:.2f}%")
-    else:
-        await update.message.reply_text("📉 Backtest: keine abgeschlossenen Trades.")
+        try:
+            days = int(context.args[0])
+        except:
+            days = None
 
+    sym = CONFIG.symbols[0]
+    lookback = days if days is not None else CONFIG.lookback_days
+
+    df, note = fetch_ohlcv_with_note(sym, CONFIG.interval, lookback)
+    if df.empty:
+        await update.message.reply_text(f"❌ Keine Daten für Backtest ({sym}).")
+        return
+
+    # Hinweis auf Quelle
+    prov = note.get("provider",""); det = note.get("detail","")
+    if prov:
+        await update.message.reply_text(f"📡 Daten: {prov} {det}")
+
+    stats = backtest_conservative(df, CONFIG,
+                                  commission_per_share=0.0005,
+                                  slippage_bps=1.0)
+
+    await update.message.reply_text(
+        "📈 Backtest (konservativ)\n"
+        f"Symbol: {sym}  TF={CONFIG.interval}\n"
+        f"Trades: {stats['trades']}\n"
+        f"WinRate: {stats['winrate']*100:.1f}%  PF: {stats['pf']:.2f}\n"
+        f"CAGR~{stats['cagr']*100:.2f}%\n"
+        f"End-Equity: {stats['equity']:.3f}x"
+    )
 async def cmd_sig(update, context):
     sym = CONFIG.symbols[0]
     df, note = fetch_ohlcv_with_note(sym, CONFIG.interval, CONFIG.lookback_days)
