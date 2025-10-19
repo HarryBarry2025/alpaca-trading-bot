@@ -1,5 +1,5 @@
 # alpaca_trading_bot.py
-import os, io, json, time, asyncio, traceback, warnings
+import os, io, json, time, asyncio, traceback, warnings, pathlib
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from typing import Optional, Dict, Any, Tuple, List
@@ -18,7 +18,7 @@ from telegram.ext import (
     Application, ApplicationBuilder,
     CommandHandler, MessageHandler, filters
 )
-from telegram.error import Conflict, BadRequest
+from telegram.error import Conflict
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -34,16 +34,56 @@ APCA_API_KEY_ID     = os.getenv("APCA_API_KEY_ID", "")
 APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY", "")
 
 # Feature-Toggles aus ENV
-ENV_ENABLE_TRADE      = os.getenv("ENABLE_TRADE", "false").lower() in ("1","true","on","yes")
-ENV_ENABLE_TIMER      = os.getenv("ENABLE_TIMER", "false").lower() in ("1","true","on","yes")
-ENV_POLL_MINUTES      = int(os.getenv("POLL_MINUTES", "10"))
-ENV_MARKET_HOURS_ONLY = os.getenv("MARKET_HOURS_ONLY", "true").lower() in ("1","true","on","yes")
+ENV_ENABLE_TRADE       = os.getenv("ENABLE_TRADE", "false").lower() in ("1","true","on","yes")
+ENV_ENABLE_TIMER       = os.getenv("ENABLE_TIMER", "false").lower() in ("1","true","on","yes")
+ENV_POLL_MINUTES       = int(os.getenv("POLL_MINUTES", "10"))
+ENV_MARKET_HOURS_ONLY  = os.getenv("MARKET_HOURS_ONLY", "true").lower() in ("1","true","on","yes")
+ENV_SYNC_TO_CANDLE     = os.getenv("SYNC_TO_CANDLE", "true").lower() in ("1","true","on","yes")
+
+# ========= Persistenz (PDT & Positionen) =========
+def _pick_data_dir() -> pathlib.Path:
+    # Priorität: /mnt/data (Render Disk) -> /var/data -> /tmp
+    for p in ("/mnt/data", "/var/data", "/tmp"):
+        try:
+            d = pathlib.Path(p)
+            d.mkdir(parents=True, exist_ok=True)
+            if os.access(d, os.W_OK):
+                return d
+        except Exception:
+            pass
+    return pathlib.Path("/tmp")
+
+DATA_DIR = _pick_data_dir()
+PDT_FILE = DATA_DIR / "pdt_trades.json"
+POS_FILE = DATA_DIR / "positions.json"
+
+def json_save_atomic(path: pathlib.Path, obj) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+def json_load(path: pathlib.Path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+    except Exception:
+        try:
+            if path.exists():
+                path.rename(path.with_suffix(path.suffix + ".corrupt"))
+        except Exception:
+            pass
+        return default
 
 # ========= Strategy Config / State =========
 class StratConfig(BaseModel):
     # Engine
-    symbols: List[str] = ["TQQQ"]          # Multi-Asset (erste ist Default für /dump)
-    interval: str = "1h"                   # '1h' oder '1d'
+    symbols: List[str] = ["TQQQ"]
+    interval: str = "1h"       # '1m','5m','15m','30m','1h','1d'
     lookback_days: int = 365
 
     # TV-kompatible Inputs (ohne MACD)
@@ -63,32 +103,36 @@ class StratConfig(BaseModel):
     poll_minutes: int = ENV_POLL_MINUTES
     live_enabled: bool = False
     market_hours_only: bool = ENV_MARKET_HOURS_ONLY
+    sync_to_candle: bool = ENV_SYNC_TO_CANDLE
 
     # Data Provider
-    data_provider: str = "alpaca"          # "alpaca" (default), "yahoo", "stooq_eod"
+    data_provider: str = "alpaca"   # "alpaca" (default), "yahoo", "stooq_eod"
     yahoo_retries: int = 3
     yahoo_backoff_sec: float = 2.0
     allow_stooq_fallback: bool = True
-    preferred_feed: str = "sip"            # "sip" (Abo) / "iex" (Fallback)
 
     # Trading Toggle
     trade_enabled: bool = ENV_ENABLE_TRADE
-    extended_hours: bool = True            # Orders auch außerhalb RTH zulassen
+
+    # PDT
+    pdt_block: bool = True   # bei PDT-Flag Einträge blocken
 
 class StratState(BaseModel):
-    positions: Dict[str, Dict[str, Any]] = {}  # {symbol: {"size":int,"avg":float,"entry_time":str|None}}
+    positions: Dict[str, Dict[str, Any]] = {}  # {symbol: {size, avg, entry_time}}
     last_status: str = "idle"
 
 CONFIG = StratConfig()
 STATE  = StratState()
 CHAT_ID: Optional[str] = DEFAULT_CHAT_ID
 
+# PDT persistenter Zustand
+PDT = json_load(PDT_FILE, default={"trades": []})  # trades: [{symbol, side, open_time, close_time}]
+
 # ========= Indicators (TV-kompatibel) =========
 def ema(s: pd.Series, n: int) -> pd.Series:
     return s.ewm(span=n, adjust=False).mean()
 
 def rsi_tv_wilder(s: pd.Series, length: int = 14) -> pd.Series:
-    # Wilder RSI (RMA)
     delta = s.diff()
     up = delta.clip(lower=0.0)
     down = (-delta).clip(lower=0.0)
@@ -102,24 +146,48 @@ def efi_tv(close: pd.Series, vol: pd.Series, length: int) -> pd.Series:
     raw = vol * (close - close.shift(1))
     return ema(raw, length)
 
-# ========= US Market Hours + Holidays =========
+# ========= US Market Hours (grob) =========
 def is_market_open_now(dt_utc: Optional[datetime] = None) -> bool:
-    # Näherung in UTC: Mo–Fr, 13:30–20:00 UTC (~ 9:30–16:00 ET), inkl. paar Feiertage
     now = dt_utc or datetime.now(timezone.utc)
+    # Feiertage (Kurzliste)
     us_holidays = {
-        # 2025 (Beispiele)
-        "2025-01-01","2025-01-20","2025-02-17","2025-04-18","2025-05-26",
-        "2025-06-19","2025-07-04","2025-09-01","2025-11-27","2025-12-25",
-        # 2024 (historisch)
-        "2024-01-01","2024-01-15","2024-02-19","2024-03-29","2024-05-27",
-        "2024-06-19","2024-07-04","2024-09-02","2024-11-28","2024-12-25",
+        "2025-01-01","2025-01-20","2025-02-17","2025-04-18","2025-05-26","2025-06-19","2025-07-04","2025-09-01","2025-11-27","2025-12-25",
+        "2024-01-01","2024-01-15","2024-02-19","2024-03-29","2024-05-27","2024-06-19","2024-07-04","2024-09-02","2024-11-28","2024-12-25",
     }
     if now.strftime("%Y-%m-%d") in us_holidays:
         return False
     if now.weekday() >= 5:
         return False
-    hhmm = now.hour * 60 + now.minute
-    return 13*60 + 30 <= hhmm <= 20*60
+    # 13:30–20:00 UTC ~ 9:30–16:00 ET
+    hhmm = now.hour*60 + now.minute
+    return 13*60+30 <= hhmm <= 20*60
+
+# ========= Candle-Sync (Timer) =========
+def _interval_to_minutes(interval: str) -> Optional[int]:
+    i = interval.lower()
+    if i == "1m": return 1
+    if i == "5m": return 5
+    if i == "15m": return 15
+    if i == "30m": return 30
+    if i in ("60m","1h"): return 60
+    if i == "1d": return None  # daily: special
+    return 60
+
+def next_candle_after(now_utc: datetime, interval: str) -> datetime:
+    """Top-of-bar Align. Für '1d' → nächste 00:00 UTC."""
+    if interval == "1d":
+        nxt = (now_utc.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1))
+        return nxt
+    mins = _interval_to_minutes(interval)
+    if mins is None:  # fallback
+        mins = 60
+    # align to next multiple of mins
+    minute = (now_utc.minute // mins) * mins
+    aligned = now_utc.replace(minute=minute, second=0, microsecond=0)
+    if aligned <= now_utc:
+        aligned = aligned + timedelta(minutes=mins)
+    # wenn genau auf :00 o.ä., passt es
+    return aligned
 
 # ========= Data Providers =========
 from urllib.parse import quote
@@ -142,10 +210,6 @@ def fetch_stooq_daily(symbol: str, lookback_days: int) -> pd.DataFrame:
         return pd.DataFrame()
 
 def fetch_alpaca_ohlcv(symbol: str, interval: str, lookback_days: int) -> pd.DataFrame:
-    """
-    Holt Bars von Alpaca Market Data v2.
-    Versucht zuerst CONFIG.preferred_feed (z.B. 'sip'), fällt dann automatisch auf 'iex' zurück.
-    """
     try:
         from alpaca.data.historical import StockHistoricalDataClient
         from alpaca.data.requests import StockBarsRequest
@@ -158,87 +222,60 @@ def fetch_alpaca_ohlcv(symbol: str, interval: str, lookback_days: int) -> pd.Dat
         print("[alpaca] missing API key/secret")
         return pd.DataFrame()
 
-    # Interval → TimeFrame
-    interval_l = interval.lower()
-    if interval_l in {"1h","60m"}:
-        tf = TimeFrame(1, TimeFrameUnit.Hour)
-    elif interval_l in {"1d","1day"}:
-        tf = TimeFrame(1, TimeFrameUnit.Day)
-    elif interval_l in {"15m"}:
-        tf = TimeFrame(15, TimeFrameUnit.Minute)
-    elif interval_l in {"5m"}:
-        tf = TimeFrame(5, TimeFrameUnit.Minute)
-    else:
-        tf = TimeFrame(1, TimeFrameUnit.Hour)
+    i = interval.lower()
+    if i in {"1h","60m"}: tf = TimeFrame(1, TimeFrameUnit.Hour)
+    elif i in {"1d","1day"}: tf = TimeFrame(1, TimeFrameUnit.Day)
+    elif i in {"30m"}: tf = TimeFrame(30, TimeFrameUnit.Minute)
+    elif i in {"15m"}: tf = TimeFrame(15, TimeFrameUnit.Minute)
+    elif i in {"5m"}: tf = TimeFrame(5, TimeFrameUnit.Minute)
+    elif i in {"1m"}: tf = TimeFrame(1, TimeFrameUnit.Minute)
+    else: tf = TimeFrame(1, TimeFrameUnit.Hour)
 
     client = StockHistoricalDataClient(APCA_API_KEY_ID, APCA_API_SECRET_KEY)
-
     end   = datetime.now(timezone.utc)
     start = end - timedelta(days=max(lookback_days, 60))
 
-    # Feed-Reihenfolge: bevorzugt, dann Fallback
-    feed_order = []
-    pf = (getattr(CONFIG, "preferred_feed", "sip") or "sip").lower()
-    if pf in ("sip","iex"):
-        feed_order.append(pf)
-    if "iex" not in feed_order:
-        feed_order.append("iex")
-    if "sip" not in feed_order:
-        feed_order.append("sip")
-
-    last_err = None
-    for feed in feed_order:
-        try:
-            req = StockBarsRequest(
-                symbol_or_symbols=symbol,
-                timeframe=tf,
-                start=start,
-                end=end,
-                feed=feed,
-                limit=10000
-            )
-            bars = client.get_stock_bars(req)
-            if not bars or bars.df is None or bars.df.empty:
-                print(f"[alpaca] empty frame feed={feed}")
-                continue
-            df = bars.df.copy()
-            if isinstance(df.index, pd.MultiIndex):
-                try:
-                    df = df.xs(symbol, level=0)
-                except Exception:
-                    pass
-            if not isinstance(df.index, pd.DatetimeIndex):
-                df.index = pd.to_datetime(df.index)
-            df.index = df.index.tz_convert("UTC") if df.index.tz is not None else df.index.tz_localize("UTC")
-            df = df.sort_index()
-            df = df.rename(columns=str.lower)
-            df["time"] = df.index
-            df.attrs["alpaca_feed_used"] = feed
-            return df[["open","high","low","close","volume","time"]]
-        except Exception as e:
-            last_err = e
-            print(f"[alpaca] fetch failed with feed={feed}: {e}")
-            continue
-
-    print("[alpaca] all feeds failed.", last_err)
-    return pd.DataFrame()
+    req = StockBarsRequest(
+        symbol_or_symbols=symbol,
+        timeframe=tf,
+        start=start,
+        end=end,
+        feed="iex",
+        limit=10000
+    )
+    try:
+        bars = client.get_stock_bars(req)
+        if not bars or bars.df is None or bars.df.empty:
+            print("[alpaca] empty frame")
+            return pd.DataFrame()
+        df = bars.df.copy()
+        if isinstance(df.index, pd.MultiIndex):
+            try: df = df.xs(symbol, level=0)
+            except Exception: pass
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
+        df.index = df.index.tz_convert("UTC") if df.index.tz is not None else df.index.tz_localize("UTC")
+        df = df.sort_index().rename(columns=str.lower)
+        df["time"] = df.index
+        return df[["open","high","low","close","volume","time"]]
+    except Exception as e:
+        print("[alpaca] fetch failed:", e)
+        return pd.DataFrame()
 
 def fetch_ohlcv_with_note(symbol: str, interval: str, lookback_days: int) -> Tuple[pd.DataFrame, Dict[str,str]]:
     note = {"provider":"","detail":""}
-    intraday_set = {"1m","2m","5m","15m","30m","60m","90m","1h"}
+    intraday = {"1m","2m","5m","15m","30m","60m","90m","1h"}
 
-    # Primary: Alpaca (default)
+    # Primary: Alpaca
     if CONFIG.data_provider.lower() == "alpaca":
         df = fetch_alpaca_ohlcv(symbol, interval, lookback_days)
         if not df.empty:
-            used = df.attrs.get("alpaca_feed_used", CONFIG.preferred_feed)
-            note.update(provider="Alpaca", detail=f"{interval}, feed={used}")
+            note.update(provider="Alpaca", detail=interval)
             return df, note
         note.update(provider="Alpaca → Yahoo", detail="Alpaca leer; versuche Yahoo")
 
     # Yahoo
-    is_intraday = interval in intraday_set
-    period = f"{min(lookback_days, 730)}d" if is_intraday else f"{lookback_days}d"
+    period = f"{min(lookback_days, 730)}d" if interval in intraday else f"{lookback_days}d"
 
     def _norm(df: pd.DataFrame) -> pd.DataFrame:
         if df is None or df.empty: return pd.DataFrame()
@@ -246,10 +283,9 @@ def fetch_ohlcv_with_note(symbol: str, interval: str, lookback_days: int) -> Tup
         if isinstance(df.columns, pd.MultiIndex):
             try: df = df.xs(symbol, axis=1)
             except Exception: pass
-        idx = df.index
-        if isinstance(idx, pd.DatetimeIndex):
+        if isinstance(df.index, pd.DatetimeIndex):
             try:
-                df.index = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+                df.index = df.index.tz_localize("UTC") if df.index.tz is None else df.index.tz_convert("UTC")
             except Exception:
                 pass
         df = df.sort_index()
@@ -260,7 +296,7 @@ def fetch_ohlcv_with_note(symbol: str, interval: str, lookback_days: int) -> Tup
         ("download", dict(tickers=symbol, interval=interval, period=period,
                           auto_adjust=False, progress=False, prepost=False, threads=False)),
         ("download", dict(tickers=symbol, interval=interval, period=period,
-                          auto_adjust=False, progress=False, prepost=True, threads=False)),
+                          auto_adjust=False, progress=False, prepost=True,  threads=False)),
         ("history",  dict(period=period, interval=interval, auto_adjust=False, prepost=True)),
     ]
     last_err=None
@@ -312,84 +348,64 @@ def compute_signals_for_frame(df: pd.DataFrame, cfg: StratConfig) -> pd.DataFram
     f["exit_cond"]  = (f["rsi"] < cfg.rsiExit) & (~f["rsi_rising"])
     return f
 
-def backtest_conservative(df: pd.DataFrame, cfg,
-                          commission_per_share: float = 0.0005,   # z.B. $0.0005 / Anteil
-                          slippage_bps: float = 1.0):             # 1 bp = 0.01%
-    """
-    Konservativer EoB-Backtest:
-      - Signale vom VOR-Bar (i-1), Ausführung am Open des Bar i
-      - SL/TP gegen Intrabar High/Low
-      - Reihenfolge: SL -> TP -> Signal-Exit (konservativ)
-      - Slippage & Kommission werden berücksichtigt
-    Rückgabe: dict mit Winrate, PF, CAGR (aus Zeitraum), Trades, Equity
-    """
-    f = compute_signals_for_frame(df, cfg).copy()
-    if len(f) < 3:
-        return {"trades":"0/0", "equity":1.0, "winrate":0.0, "pf":0.0, "cagr":0.0}
-
-    pos=0; avg=0.0; eq=1.0; R=[]; entries=exits=0
-
-    # Testdauer (für CAGR)
-    start_dt = pd.to_datetime(f.index[0])
-    end_dt   = pd.to_datetime(f.index[-1])
-    days_span = max(1, (end_dt - start_dt).days)
-
-    for i in range(1, len(f)):
-        prev = f.iloc[i-1]                   # Signale immer vom abgeschlossenen Bar
-        o = float(f["open"].iloc[i])         # Ausführung am aktuellen Open
-        h = float(f["high"].iloc[i])
-        l = float(f["low"].iloc[i])
-        # c = float(f["close"].iloc[i])      # Close wird nicht für Trades genutzt
-
-        if pos == 0:
-            if bool(prev["entry_cond"]):
-                buy_px = o * (1 + slippage_bps/10000) + commission_per_share
-                pos = 1
-                avg = buy_px
-                entries += 1
-        else:
-            sl = avg * (1 - cfg.slPerc/100.0)
-            tp = avg * (1 + cfg.tpPerc/100.0)
-
-            # Konservative Reihenfolge: SL zuerst, dann TP, dann Signal-Exit
-            if l <= sl and h >= tp:
-                sell_px = sl * (1 - slippage_bps/10000) - commission_per_share
-                r = (sell_px - avg) / avg
-                eq *= (1 + r); R.append(r); exits += 1
-                pos = 0; avg = 0.0
-            elif l <= sl:
-                sell_px = sl * (1 - slippage_bps/10000) - commission_per_share
-                r = (sell_px - avg) / avg
-                eq *= (1 + r); R.append(r); exits += 1
-                pos = 0; avg = 0.0
-            elif h >= tp:
-                sell_px = tp * (1 - slippage_bps/10000) - commission_per_share
-                r = (sell_px - avg) / avg
-                eq *= (1 + r); R.append(r); exits += 1
-                pos = 0; avg = 0.0
-            elif bool(prev["exit_cond"]):
-                sell_px = o * (1 - slippage_bps/10000) - commission_per_share
-                r = (sell_px - avg) / avg
-                eq *= (1 + r); R.append(r); exits += 1
-                pos = 0; avg = 0.0
-
-    stats = {"trades": f"{entries}/{exits}", "equity": float(eq)}
-    if R:
-        a = np.array(R)
-        win = float((a > 0).mean())
-        pf  = float(a[a>0].sum() / (1e-9 + -a[a<0].sum() if (a<0).any() else 1e-9))
-        cagr = float((eq ** (365.0 / days_span)) - 1.0) if eq > 0 else 0.0
-        stats.update(winrate=win, pf=pf, cagr=cagr)
-    else:
-        stats.update(winrate=0.0, pf=0.0, cagr=0.0)
-    return stats
-
 def build_export_frame(df: pd.DataFrame, cfg: StratConfig) -> pd.DataFrame:
     f = compute_signals_for_frame(df, cfg)
     cols = ["open","high","low","close","volume","rsi","efi","rsi_rising","efi_rising","entry_cond","exit_cond","time"]
     return f[cols]
 
-# ========= Strategy step (per Symbol) =========
+# ========= PDT-Logik =========
+US_EASTERN_OFFSET = -4  # grob EDT
+def _to_et_date(iso_str: str) -> str:
+    dt = pd.to_datetime(iso_str).tz_convert("UTC")
+    # vereinfachte ET (kein DST-Switch), reicht für Daytrade-Erkennung im Backtest
+    et = dt.tz_convert(timezone(timedelta(hours=US_EASTERN_OFFSET)))
+    return et.strftime("%Y-%m-%d")
+
+def pdt_record_open(sym: str, open_time_iso: str):
+    PDT["trades"].append({"symbol": sym, "open_time": open_time_iso, "close_time": None})
+    json_save_atomic(PDT_FILE, PDT)
+
+def pdt_record_close(sym: str, close_time_iso: str):
+    # schnapp dir die letzte offene
+    for trade in reversed(PDT["trades"]):
+        if trade["symbol"] == sym and trade.get("close_time") is None:
+            trade["close_time"] = close_time_iso
+            break
+    json_save_atomic(PDT_FILE, PDT)
+
+def pdt_summary(now_utc: Optional[datetime] = None) -> Dict[str, Any]:
+    now = now_utc or datetime.now(timezone.utc)
+    # Fenster: letzte 5 Handelstage (vereinfachend: 7 Kalendertage rückwärts)
+    window_start = (now - timedelta(days=7))
+    # Day-Trades = Open & Close am gleichen ET-Kalendertag
+    daytrades = []
+    total_trades = 0
+    for t in PDT.get("trades", []):
+        ot = t.get("open_time"); ct = t.get("close_time")
+        if not ot: continue
+        try:
+            ot_dt = pd.to_datetime(ot, utc=True)
+        except Exception:
+            continue
+        if ot_dt < window_start:  # außerhalb Fenster
+            continue
+        total_trades += 1  # jede Runde zählt als 1 Trade (vereinfachte Zählung)
+        if ct:
+            if _to_et_date(ot) == _to_et_date(ct):
+                daytrades.append(t)
+
+    day_count = len(daytrades)
+    # Alpaca-Regel: 4+ Daytrades innerhalb 5 Geschäftstagen UND >6% der Gesamt-Trades
+    would_flag = (day_count >= 4) and (total_trades == 0 or (day_count / max(total_trades, 1) > 0.06))
+    return {
+        "window_days": 7,
+        "day_trades": day_count,
+        "total_trades": total_trades,
+        "would_flag_now": bool(would_flag),
+        "block_entries": CONFIG.pdt_block and bool(would_flag)
+    }
+
+# ========= Strategy step =========
 def bar_logic_last(df: pd.DataFrame, cfg: StratConfig, sym: str) -> Dict[str,Any]:
     if df.empty or len(df) < max(cfg.rsiLen, cfg.efiLen) + 3:
         return {"action":"none","reason":"not_enough_data","symbol":sym}
@@ -410,7 +426,7 @@ def bar_logic_last(df: pd.DataFrame, cfg: StratConfig, sym: str) -> Dict[str,Any
     def sl(p): return p*(1-cfg.slPerc/100.0)
     def tp(p): return p*(1+cfg.tpPerc/100.0)
 
-    # Bars seit Entry
+    # bars since entry (EOB approx)
     bars_in_trade=0
     if entry_time is not None:
         since = df[df["time"] >= pd.to_datetime(entry_time, utc=True)]
@@ -418,7 +434,7 @@ def bar_logic_last(df: pd.DataFrame, cfg: StratConfig, sym: str) -> Dict[str,Any
 
     if size==0:
         if entry_cond:
-            q = 1  # Demo-Größe
+            q = 1
             return {"action":"buy","symbol":sym,"qty":q,"px":price_open,"time":str(ts),
                     "sl":sl(price_open),"tp":tp(price_open),"reason":"rule_entry",
                     "rsi":float(last["rsi"]), "efi":float(last["efi"])}
@@ -451,8 +467,7 @@ POLLING_STARTED = False
 
 async def send_text(chat_id: str, text: str):
     if tg_app is None: return
-    if not text or not text.strip():
-        text = "ℹ️ (leer)"
+    if not text or not text.strip(): text = "ℹ️ (leer)"
     try:
         await tg_app.bot.send_message(chat_id=chat_id, text=text)
     except Exception as e:
@@ -484,10 +499,6 @@ def alpaca_trading_client():
         return None
 
 async def place_market_order(sym: str, qty: int, side: str, tif: str = "day") -> str:
-    """
-    side: 'buy'|'sell'
-    tif : 'day'|'gtc'|'opg'|'cls'|'ioc'|'fok'
-    """
     client = alpaca_trading_client()
     if client is None: return "alpaca client not available"
     try:
@@ -501,8 +512,7 @@ async def place_market_order(sym: str, qty: int, side: str, tif: str = "day") ->
             symbol=sym,
             qty=qty,
             side=OrderSide.BUY if side=="buy" else OrderSide.SELL,
-            time_in_force=tif_map.get(tif.lower(), TimeInForce.DAY),
-            extended_hours=bool(getattr(CONFIG, "extended_hours", False))
+            time_in_force=tif_map.get(tif.lower(), TimeInForce.DAY)
         )
         order = client.submit_order(order_data=req)
         return f"order_id={order.id}"
@@ -529,8 +539,7 @@ def alpaca_positions() -> List[Dict[str,Any]]:
 
 def alpaca_account() -> Dict[str,Any]:
     client = alpaca_trading_client()
-    if client is None:
-        return {}
+    if client is None: return {}
     try:
         acc = client.get_account()
         return {
@@ -538,16 +547,12 @@ def alpaca_account() -> Dict[str,Any]:
             "equity": float(acc.equity),
             "cash": float(acc.cash),
             "buying_power": float(acc.buying_power),
-            "multiplier": acc.multiplier,
-            "daytrade_count": acc.daytrade_count,
-            "pattern_day_trader": acc.pattern_day_trader,
-            "daytrading_buying_power": float(acc.daytrading_buying_power)
+            "multiplier": acc.multiplier
         }
     except Exception as e:
-        print("alpaca_account error:", e)
-        return {}
+        print("alpaca_account error:", e); return {}
 
-# ========= Helpers =========
+# ========= Single-step runner =========
 def friendly_note(note: Dict[str,str]) -> str:
     prov = note.get("provider",""); det = note.get("detail","")
     if not prov: return ""
@@ -555,7 +560,6 @@ def friendly_note(note: Dict[str,str]) -> str:
         return f"📡 Datenquelle: {prov} – {det}"
     return f"📡 Datenquelle: {prov} ({det})"
 
-# ========= Single-step runner =========
 async def run_once_for_symbol(sym: str, send_signals: bool = True) -> Dict[str,Any]:
     df, note = fetch_ohlcv_with_note(sym, CONFIG.interval, CONFIG.lookback_days)
     if df.empty:
@@ -564,79 +568,109 @@ async def run_once_for_symbol(sym: str, send_signals: bool = True) -> Dict[str,A
     act = bar_logic_last(df, CONFIG, sym)
     STATE.last_status = f"{sym}: {act['action']} ({act['reason']})"
 
-    # Meldungen
     if send_signals and CHAT_ID:
         await send_text(CHAT_ID, f"ℹ️ {sym} {CONFIG.interval} rsi={act.get('rsi',np.nan):.2f} efi={act.get('efi',np.nan):.2f} • {act['reason']}")
         note_msg = friendly_note(note)
         if note_msg and ("Fallback" in note_msg or CONFIG.data_provider!="alpaca"):
             await send_text(CHAT_ID, note_msg)
 
-    # Trading (Paper) – nur wenn freigegeben und ggf. Markt offen
+    # PDT-Block prüfen
+    pdt = pdt_summary()
+    if CONFIG.pdt_block and pdt["block_entries"] and act["action"] == "buy":
+        if CHAT_ID and send_signals:
+            await send_text(CHAT_ID, "⛔ PDT-Block aktiv – Entry verhindert.")
+        act = {**act, "action":"none", "reason":"pdt_block"}
+
+    # Trading (Paper)
     if CONFIG.trade_enabled and act["action"] in ("buy","sell"):
         if CONFIG.market_hours_only and not is_market_open_now():
-            if CHAT_ID:
+            if CHAT_ID and send_signals:
                 await send_text(CHAT_ID, "⛔ Markt geschlossen – kein Trade ausgeführt.")
         else:
             side = "buy" if act["action"]=="buy" else "sell"
-            tif  = "day"
-            info = await place_market_order(sym, int(act["qty"]), side, tif)
-            if CHAT_ID:
+            info = await place_market_order(sym, int(act["qty"]), side, "day")
+            if CHAT_ID and send_signals:
                 await send_text(CHAT_ID, f"🛒 {side.upper()} {sym} x{act['qty']} @ {act['px']:.4f} • {info}")
 
-    # Lokale Sim-Position (falls Alpaca-Order nicht betrachtet werden soll)
+    # Simulierte Position & PDT-Persistenz
     pos = STATE.positions.get(sym, {"size":0, "avg":0.0, "entry_time":None})
     if act["action"]=="buy" and pos["size"]==0:
         STATE.positions[sym] = {"size":act["qty"],"avg":act["px"],"entry_time":act["time"]}
+        pdt_record_open(sym, act["time"])
         if CHAT_ID and send_signals:
             await send_text(CHAT_ID, f"🟢 LONG (sim) {sym} @ {act['px']:.4f} | SL={act.get('sl',np.nan):.4f} TP={act.get('tp',np.nan):.4f}")
     elif act["action"]=="sell" and pos["size"]>0:
         pnl = (act["px"] - pos["avg"]) / pos["avg"]
         STATE.positions[sym] = {"size":0,"avg":0.0,"entry_time":None}
+        pdt_record_close(sym, act["time"])
         if CHAT_ID and send_signals:
             await send_text(CHAT_ID, f"🔴 EXIT (sim) {sym} @ {act['px']:.4f} • {act['reason']} • PnL={pnl*100:.2f}%")
 
+    # Positionen persistieren (optional)
+    try:
+        json_save_atomic(POS_FILE, STATE.positions)
+    except Exception:
+        pass
+
     return {"ok":True,"act":act}
 
-# ========= Background Timer =========
+# ========= Background Timer (Candle-synchronisiert) =========
 TIMER = {
     "enabled": ENV_ENABLE_TIMER,
     "running": False,
     "poll_minutes": CONFIG.poll_minutes,
     "last_run": None,
     "next_due": None,
-    "market_hours_only": CONFIG.market_hours_only
+    "market_hours_only": CONFIG.market_hours_only,
+    "sync_to_candle": CONFIG.sync_to_candle
 }
+TIMER_TASK: Optional[asyncio.Task] = None
 
 async def timer_loop():
     TIMER["running"] = True
     try:
-        # initial next_due setzen
-        now0 = datetime.now(timezone.utc)
-        TIMER["next_due"] = (now0 + timedelta(minutes=TIMER["poll_minutes"])).isoformat()
-
         while TIMER["enabled"]:
             now = datetime.now(timezone.utc)
 
-            # Market hours filter
+            # Marktzeiten-Filter
             if TIMER["market_hours_only"] and not is_market_open_now(now):
-                # außerhalb der Marktzeit nur warten
-                await asyncio.sleep(30)
+                # setze next_due auf nächste Candle nach Marktöffnung
+                # (vereinfachend: prüfe alle 60s)
+                TIMER["next_due"] = None
+                await asyncio.sleep(60)
                 continue
 
-            # fällig?
-            due = TIMER["next_due"]
-            is_due = (TIMER["last_run"] is None) or (due and now >= datetime.fromisoformat(due))
-            if is_due:
-                for sym in CONFIG.symbols:
-                    await run_once_for_symbol(sym, send_signals=True)
-                TIMER["last_run"] = now.isoformat()
-                TIMER["next_due"] = (now + timedelta(minutes=TIMER["poll_minutes"])).isoformat()
+            # Wenn Candle-Sync aktiv → bis nächste Candle schlafen
+            if TIMER["sync_to_candle"]:
+                due_dt = next_candle_after(now, CONFIG.interval)
+                TIMER["next_due"] = due_dt.isoformat()
+                # sleep bis due_dt (max. 5s Granularität)
+                while datetime.now(timezone.utc) < due_dt and TIMER["enabled"]:
+                    await asyncio.sleep(1)
+            else:
+                # Poll-Modus (fester Abstand)
+                if TIMER["next_due"] is None:
+                    TIMER["next_due"] = (now + timedelta(minutes=TIMER["poll_minutes"])).isoformat()
+                else:
+                    nd = pd.to_datetime(TIMER["next_due"], utc=True).to_pydatetime()
+                    if now < nd:
+                        await asyncio.sleep(1)
+                        continue
 
-            await asyncio.sleep(5)
+            # Run
+            for sym in CONFIG.symbols:
+                await run_once_for_symbol(sym, send_signals=True)
+            now2 = datetime.now(timezone.utc)
+            TIMER["last_run"] = now2.isoformat()
+            if TIMER["sync_to_candle"]:
+                TIMER["next_due"] = next_candle_after(now2, CONFIG.interval).isoformat()
+            else:
+                TIMER["next_due"] = (now2 + timedelta(minutes=TIMER["poll_minutes"])).isoformat()
+
+            # kleine Pause, damit /timerstatus nicht „busy“ spammt
+            await asyncio.sleep(0.1)
     finally:
         TIMER["running"] = False
-
-TIMER_TASK: Optional[asyncio.Task] = None
 
 # ========= Telegram Commands =========
 async def cmd_start(update, context):
@@ -650,7 +684,7 @@ async def cmd_start(update, context):
         "/dump [csv [N]], /dumpcsv [N]\n"
         "/trade on|off, /pos, /account\n"
         "/timer on|off, /timerstatus, /timerrunnow\n"
-        "/envcheck, /tgstatus"
+        "/pdtstatus, /pdtreset"
     )
 
 async def cmd_status(update, context):
@@ -658,16 +692,15 @@ async def cmd_status(update, context):
     for s,p in STATE.positions.items():
         pos_lines.append(f"{s}: size={p['size']} avg={p['avg']:.4f} since={p['entry_time']}")
     pos_txt = "\n".join(pos_lines) if pos_lines else "keine (sim)"
-
     await update.message.reply_text(
         "📊 Status\n"
         f"Symbols: {', '.join(CONFIG.symbols)}  TF={CONFIG.interval}\n"
-        f"Provider: {CONFIG.data_provider} (preferred_feed={CONFIG.preferred_feed})\n"
+        f"Provider: {CONFIG.data_provider}\n"
         f"Live: {'ON' if CONFIG.live_enabled else 'OFF'} • Timer: {'ON' if TIMER['enabled'] else 'OFF'} "
-        f"(alle {TIMER['poll_minutes']}m, market-hours-only={TIMER['market_hours_only']})\n"
+        f"(TF-Sync={'ON' if TIMER['sync_to_candle'] else 'OFF'}, MktHoursOnly={TIMER['market_hours_only']})\n"
         f"LastStatus: {STATE.last_status}\n"
         f"Sim-Pos:\n{pos_txt}\n"
-        f"Trading: {'ON' if CONFIG.trade_enabled else 'OFF'} (Paper, extended_hours={CONFIG.extended_hours})"
+        f"Trading: {'ON' if CONFIG.trade_enabled else 'OFF'} (Paper)"
     )
 
 async def cmd_cfg(update, context):
@@ -678,20 +711,16 @@ def set_from_kv(kv: str) -> str:
     mapping = {"sl":"slPerc", "tp":"tpPerc", "samebar":"allowSameBarExit", "cooldown":"minBarsInTrade"}
     k = mapping.get(k,k)
     if not hasattr(CONFIG, k): return f"❌ unbekannter Key: {k}"
-    if k == "preferred_feed":
-        vv = v.lower()
-        if vv not in ("sip","iex"):
-            return "❌ preferred_feed muss 'sip' oder 'iex' sein"
-        setattr(CONFIG, k, vv)
-        return f"✓ preferred_feed = {vv}"
     cur = getattr(CONFIG, k)
     if isinstance(cur, bool):   setattr(CONFIG, k, v.lower() in ("1","true","on","yes"))
     elif isinstance(cur, int):  setattr(CONFIG, k, int(float(v)))
     elif isinstance(cur, float):setattr(CONFIG, k, float(v))
     elif isinstance(cur, list): setattr(CONFIG, k, [x.strip() for x in v.split(",") if x.strip()])
     else:                       setattr(CONFIG, k, v)
+    # Sync in TIMER falls relevant
     if k=="poll_minutes": TIMER["poll_minutes"]=getattr(CONFIG,k)
     if k=="market_hours_only": TIMER["market_hours_only"]=getattr(CONFIG,k)
+    if k=="sync_to_candle": TIMER["sync_to_candle"]=getattr(CONFIG,k)
     return f"✓ {k} = {getattr(CONFIG,k)}"
 
 async def cmd_set(update, context):
@@ -702,8 +731,9 @@ async def cmd_set(update, context):
             "/set rsiLow=0 rsiHigh=68 rsiExit=48 sl=1 tp=4\n"
             "/set interval=1h lookback_days=365\n"
             "/set symbols=TQQQ,QQQ,SPY\n"
-            "/set data_provider=alpaca preferred_feed=sip\n"
-            "/set poll_minutes=10 market_hours_only=true extended_hours=true\n"
+            "/set data_provider=alpaca\n"
+            "/set poll_minutes=10 market_hours_only=true sync_to_candle=true\n"
+            "/set pdt_block=true"
         ); return
     msgs=[]; errs=[]
     for a in context.args:
@@ -747,39 +777,38 @@ async def cmd_run(update, context):
         await run_once_for_symbol(sym, send_signals=True)
 
 async def cmd_bt(update, context):
-    # Optional: Tage aus Argument übernehmen
-    days = None
+    days = 180
     if context.args:
-        try:
-            days = int(context.args[0])
-        except:
-            days = None
-
+        try: days = int(context.args[0])
+        except: pass
     sym = CONFIG.symbols[0]
-    lookback = days if days is not None else CONFIG.lookback_days
-
-    df, note = fetch_ohlcv_with_note(sym, CONFIG.interval, lookback)
+    df, note = fetch_ohlcv_with_note(sym, CONFIG.interval, days)
     if df.empty:
-        await update.message.reply_text(f"❌ Keine Daten für Backtest ({sym}).")
-        return
+        await update.message.reply_text(f"❌ Keine Daten für Backtest ({sym})."); return
+    f = compute_signals_for_frame(df, CONFIG)
+    pos=0; avg=0.0; eq=1.0; R=[]; entries=exits=0
+    for i in range(2,len(f)):
+        row, prev = f.iloc[i], f.iloc[i-1]
+        entry = bool(row["entry_cond"])
+        exitc = bool(row["exit_cond"])
+        if pos==0 and entry:
+            pos=1; avg=float(row["open"]); entries+=1
+        elif pos==1:
+            sl = avg*(1-CONFIG.slPerc/100); tp = avg*(1+CONFIG.tpPerc/100)
+            price = float(row["close"])
+            stop = price<=sl; take=price>=tp
+            if exitc or stop or take:
+                px = sl if stop else tp if take else float(row["open"])
+                r = (px-avg)/avg
+                eq*= (1+r); R.append(r); exits+=1
+                pos=0; avg=0.0
+    if R:
+        a=np.array(R); win=(a>0).mean(); pf=a[a>0].sum()/(1e-9 + -a[a<0].sum() if (a<0).any() else 1e-9)
+        cagr=(eq**(365/max(1,days))-1)
+        await update.message.reply_text(f"📈 Backtest {days}d  Trades={entries}/{exits}  Win={win*100:.1f}%  PF={pf:.2f}  CAGR~{cagr*100:.2f}%")
+    else:
+        await update.message.reply_text("📉 Backtest: keine abgeschlossenen Trades.")
 
-    # Hinweis auf Quelle
-    prov = note.get("provider",""); det = note.get("detail","")
-    if prov:
-        await update.message.reply_text(f"📡 Daten: {prov} {det}")
-
-    stats = backtest_conservative(df, CONFIG,
-                                  commission_per_share=0.0005,
-                                  slippage_bps=1.0)
-
-    await update.message.reply_text(
-        "📈 Backtest (konservativ)\n"
-        f"Symbol: {sym}  TF={CONFIG.interval}\n"
-        f"Trades: {stats['trades']}\n"
-        f"WinRate: {stats['winrate']*100:.1f}%  PF: {stats['pf']:.2f}\n"
-        f"CAGR~{stats['cagr']*100:.2f}%\n"
-        f"End-Equity: {stats['equity']:.3f}x"
-    )
 async def cmd_sig(update, context):
     sym = CONFIG.symbols[0]
     df, note = fetch_ohlcv_with_note(sym, CONFIG.interval, CONFIG.lookback_days)
@@ -791,8 +820,7 @@ async def cmd_sig(update, context):
         f"🔎 {sym} {CONFIG.interval}\n"
         f"rsi={last['rsi']:.2f} (rising={bool(last['rsi_rising'])})  "
         f"efi={last['efi']:.2f} (rising={bool(last['efi_rising'])})\n"
-        f"entry={bool(last['entry_cond'])}  exit={bool(last['exit_cond'])}\n"
-        f"{friendly_note(note)}"
+        f"entry={bool(last['entry_cond'])}  exit={bool(last['exit_cond'])}"
     ).strip()
     await update.message.reply_text(txt)
 
@@ -820,10 +848,10 @@ async def cmd_plot(update, context):
     ax3.plot(f.index, f["efi"], label="EFI")
     ax3.set_title("EFI (EMA(vol*Δclose))"); ax3.grid(True); ax3.legend(loc="best")
 
-    chat_id = str(update.effective_chat.id)
-    await send_png(chat_id, fig,  f"{sym}_{CONFIG.interval}_close.png", "📈 Close")
-    await send_png(chat_id, fig2, f"{sym}_{CONFIG.interval}_rsi.png",   "📈 RSI")
-    await send_png(chat_id, fig3, f"{sym}_{CONFIG.interval}_efi.png",   "📈 EFI")
+    cid = str(update.effective_chat.id)
+    await send_png(cid, fig,  f"{sym}_{CONFIG.interval}_close.png", "📈 Close")
+    await send_png(cid, fig2, f"{sym}_{CONFIG.interval}_rsi.png",   "📈 RSI")
+    await send_png(cid, fig3, f"{sym}_{CONFIG.interval}_efi.png",   "📈 EFI")
 
 async def cmd_dump(update, context):
     sym = CONFIG.symbols[0]
@@ -848,7 +876,6 @@ async def cmd_dump(update, context):
     last = f.iloc[-1]
     payload = {
         "symbol": sym, "interval": CONFIG.interval, "provider": note.get("provider",""),
-        "detail": note.get("detail",""),
         "time": str(last["time"]),
         "open": float(last["open"]), "high": float(last["high"]), "low": float(last["low"]), "close": float(last["close"]),
         "volume": float(last["volume"]),
@@ -877,7 +904,9 @@ async def cmd_timerstatus(update, context):
         "poll_minutes": TIMER["poll_minutes"],
         "last_run": TIMER["last_run"],
         "next_due": TIMER["next_due"],
-        "market_hours_only": TIMER["market_hours_only"]
+        "market_hours_only": TIMER["market_hours_only"],
+        "sync_to_candle": TIMER["sync_to_candle"],
+        "data_dir": str(DATA_DIR)
     }, indent=2))
 
 async def cmd_timerrunnow(update, context):
@@ -885,26 +914,28 @@ async def cmd_timerrunnow(update, context):
         await run_once_for_symbol(sym, send_signals=True)
     now = datetime.now(timezone.utc)
     TIMER["last_run"] = now.isoformat()
-    TIMER["next_due"] = (now + timedelta(minutes=TIMER["poll_minutes"])).isoformat()
+    TIMER["next_due"] = (next_candle_after(now, CONFIG.interval).isoformat()
+                         if TIMER["sync_to_candle"]
+                         else (now + timedelta(minutes=TIMER["poll_minutes"])).isoformat())
     await update.message.reply_text("⏱️ Timer-Run ausgeführt.")
 
-async def cmd_envcheck(update, context):
-    def chk(k):
-        v=os.getenv(k); return {"present": bool(v), "len": len(v) if v else 0}
-    env = {
-        "TELEGRAM_BOT_TOKEN": chk("TELEGRAM_BOT_TOKEN"),
-        "DEFAULT_CHAT_ID": chk("DEFAULT_CHAT_ID"),
-        "APCA_API_KEY_ID": chk("APCA_API_KEY_ID"),
-        "APCA_API_SECRET_KEY": chk("APCA_API_SECRET_KEY"),
-        "ENABLE_TRADE": os.getenv("ENABLE_TRADE",""),
-        "ENABLE_TIMER": os.getenv("ENABLE_TIMER",""),
-        "POLL_MINUTES": os.getenv("POLL_MINUTES",""),
-        "MARKET_HOURS_ONLY": os.getenv("MARKET_HOURS_ONLY",""),
+async def cmd_pdtstatus(update, context):
+    s = pdt_summary()
+    msg = {
+        "window_days": s["window_days"],
+        "day_trades": s["day_trades"],
+        "total_trades": s["total_trades"],
+        "would_flag_now": s["would_flag_now"],
+        "pdt_block_enabled": CONFIG.pdt_block,
+        "blocks_entry_now": s["block_entries"],
+        "store": str(PDT_FILE)
     }
-    await update.message.reply_text("🔧 ENV\n" + json.dumps(env, indent=2))
+    await update.message.reply_text("🚦 PDT-Status\n" + json.dumps(msg, indent=2))
 
-async def cmd_tgstatus(update, context):
-    await update.message.reply_text(json.dumps({"polling_started": POLLING_STARTED}, indent=2))
+async def cmd_pdtreset(update, context):
+    PDT["trades"].clear()
+    json_save_atomic(PDT_FILE, PDT)
+    await update.message.reply_text("🧹 PDT-Log lokal zurückgesetzt (Alpaca-Flag unverändert).")
 
 async def on_message(update, context):
     await update.message.reply_text("Unbekannter Befehl. /start für Hilfe")
@@ -935,8 +966,8 @@ async def lifespan(app: FastAPI):
         tg_app.add_handler(CommandHandler("timer",        cmd_timer))
         tg_app.add_handler(CommandHandler("timerstatus",  cmd_timerstatus))
         tg_app.add_handler(CommandHandler("timerrunnow",  cmd_timerrunnow))
-        tg_app.add_handler(CommandHandler("envcheck",     cmd_envcheck))
-        tg_app.add_handler(CommandHandler("tgstatus",     cmd_tgstatus))
+        tg_app.add_handler(CommandHandler("pdtstatus",    cmd_pdtstatus))
+        tg_app.add_handler(CommandHandler("pdtreset",     cmd_pdtreset))
         tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
         await tg_app.initialize()
@@ -1007,16 +1038,17 @@ async def root():
         "symbols": CONFIG.symbols,
         "interval": CONFIG.interval,
         "provider": CONFIG.data_provider,
-        "preferred_feed": CONFIG.preferred_feed,
         "live": CONFIG.live_enabled,
         "timer": {
             "enabled": TIMER["enabled"],
             "running": TIMER["running"],
             "poll_minutes": TIMER["poll_minutes"],
-            "next_due": TIMER["next_due"]
+            "next_due": TIMER["next_due"],
+            "sync_to_candle": TIMER["sync_to_candle"]
         },
         "trade_enabled": CONFIG.trade_enabled,
-        "extended_hours": CONFIG.extended_hours
+        "pdt_block": CONFIG.pdt_block,
+        "data_dir": str(DATA_DIR)
     }
 
 @app.get("/tick")
@@ -1025,7 +1057,9 @@ async def tick():
         await run_once_for_symbol(sym, send_signals=False)
     now = datetime.now(timezone.utc)
     TIMER["last_run"]=now.isoformat()
-    TIMER["next_due"]=(now + timedelta(minutes=TIMER["poll_minutes"])).isoformat()
+    TIMER["next_due"]=(next_candle_after(now, CONFIG.interval).isoformat()
+                       if TIMER["sync_to_candle"]
+                       else (now + timedelta(minutes=TIMER["poll_minutes"])).isoformat())
     return {"ran": True, "at": TIMER["last_run"]}
 
 @app.get("/envcheck")
@@ -1041,6 +1075,9 @@ def envcheck():
         "ENABLE_TIMER": os.getenv("ENABLE_TIMER",""),
         "POLL_MINUTES": os.getenv("POLL_MINUTES",""),
         "MARKET_HOURS_ONLY": os.getenv("MARKET_HOURS_ONLY",""),
+        "SYNC_TO_CANDLE": os.getenv("SYNC_TO_CANDLE",""),
+        "DATA_DIR": str(DATA_DIR),
+        "PDT_FILE": str(PDT_FILE)
     }
 
 @app.get("/tgstatus")
