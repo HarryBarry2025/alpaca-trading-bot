@@ -624,23 +624,28 @@ async def run_once_for_symbol(sym: str, send_signals: bool = True) -> Dict[str,A
 
 # ========= Timer Synchronisation (TV-aligned) =========
 def next_tv_aligned_due(now: datetime, interval: str) -> datetime:
-    # returns next boundary in UTC for '1h' (on :00 or :30) and '15m' (quarter hours)
+    """
+    TV-Sync: 
+      - 1h  -> immer zur halben Stunde (:30)
+      - 15m -> :00/:15/:30/:45
+      - sonst -> normales poll_minutes
+    """
     m = now.minute
     if interval == "1h":
-        # next :00 or :30
+        # IMMER auf :30 ausrichten
         if m < 30:
-            due = now.replace(minute=30, second=0, microsecond=0)
+            return now.replace(minute=30, second=0, microsecond=0)
         else:
-            due = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-        return due
+            return (now + timedelta(hours=1)).replace(minute=30, second=0, microsecond=0)
+
     if interval == "15m":
         nxt = ((m // 15) + 1) * 15
         if nxt >= 60:
-            due = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+            return (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
         else:
-            due = now.replace(minute=nxt, second=0, microsecond=0)
-        return due
-    # default: poll_minutes cadence
+            return now.replace(minute=nxt, second=0, microsecond=0)
+
+    # Fallback: konfiguriertes Polling
     return now + timedelta(minutes=TIMER["poll_minutes"])
 
 # ========= Background Timer =========
