@@ -57,6 +57,21 @@ class StratConfig(BaseModel):
     interval: str = "1h"             # '1h','15m','1d' …
     lookback_days: int = 365
 
+class StratConfig(BaseModel):
+    # ... (deine Felder)
+    # ---- TV-Sync Flags ----
+    align_hourly_to_half: bool = True     # 1h-Kerzen auf xx:30 UTC bündeln (TV)
+    rth_only: bool = True                 # nur Regular Trading Hours (TV: Extended off)
+    drop_last_incomplete: bool = True     # laufende Bar ignorieren
+
+    # ---- Sizer ----
+    sizing_mode: str = "percent_equity"   # shares | percent_equity | notional_usd | risk
+    sizing_value: float = 100.0           # je nach Modus: Stk / % / USD / %Equity-at-risk
+    max_position_pct: float = 100.0       # Kappung (vom Equity)
+
+
+
+
     # TV-kompatible Inputs (Wilder RSI / EFI)
     rsiLen: int = 12
     rsiLow: float = 0.0         # explizit Default 0
@@ -199,15 +214,109 @@ def fetch_alpaca_ohlcv(symbol: str, interval: str, lookback_days: int) -> pd.Dat
         print("[alpaca] fetch failed:", e)
         return pd.DataFrame()
 
-def fetch_ohlcv_with_note(symbol: str, interval: str, lookback_days: int) -> Tuple[pd.DataFrame, Dict[str,str]]:
+def fetch_alpaca_minutes(symbol: str, lookback_days: int, feed: str = None) -> pd.DataFrame:
+    try:
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+    except Exception as e:
+        print("[alpaca] minute fetch: lib err:", e)
+        return pd.DataFrame()
+
+    if not (APCA_API_KEY_ID and APCA_API_SECRET_KEY):
+        print("[alpaca] missing creds")
+        return pd.DataFrame()
+
+    feed = feed or os.getenv("APCA_DATA_FEED", "sip")
+    client = StockHistoricalDataClient(APCA_API_KEY_ID, APCA_API_SECRET_KEY)
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=max(lookback_days, 7))
+
+    req = StockBarsRequest(
+        symbol_or_symbols=symbol,
+        timeframe=TimeFrame.Minute,
+        start=start, end=end,
+        feed=feed,
+        limit=50000
+    )
+    try:
+        bars = client.get_stock_bars(req)
+        if not bars or bars.df is None or bars.df.empty:
+            return pd.DataFrame()
+        df = bars.df.copy()
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.xs(symbol, level=0)
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index, utc=True)
+        else:
+            df.index = df.index.tz_convert("UTC")
+        df = df.rename(columns=str.lower).sort_index()
+        df["time"] = df.index
+        return df[["open","high","low","close","volume","time"]]
+    except Exception as e:
+        print("[alpaca] minute fetch failed:", e)
+        return pd.DataFrame()
+
+
+def filter_us_rth_minutes(df_min: pd.DataFrame) -> pd.DataFrame:
+    if df_min.empty: return df_min
+    idx = df_min.index
+    is_weekday = idx.weekday < 5
+    mins = idx.hour * 60 + idx.minute
+    # RTH grob: 13:30–20:00 UTC
+    is_rth = (mins >= 13*60 + 30) & (mins <= 20*60)
+    return df_min[is_weekday & is_rth].copy()
+
+
+def resample_to_hourly_halfhour(df_min: pd.DataFrame) -> pd.DataFrame:
+    if df_min.empty: return df_min
+    agg = {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
+    # label/closed=right + offset=30min -> Bar schließt auf xx:30 UTC (TV)
+    h = df_min.resample("60T", label="right", closed="right", offset="30min").agg(agg).dropna()
+    h["time"] = h.index
+    return h
+
+
+def drop_incomplete_last(h: pd.DataFrame) -> pd.DataFrame:
+    if h.empty: return h
+    # Wenn jetzt < nächste xx:30, letzte Bar ist „laufend“
+    now = datetime.now(timezone.utc)
+    last_close = h.index[-1]
+    # nächste xx:30 ist +60 Min, weil resample bereits auf xx:30 anchored ist
+    if now < (last_close + timedelta(hours=1)):
+        return h.iloc[:-1]
+    return h
+
+ddef fetch_ohlcv_with_note(symbol: str, interval: str, lookback_days: int):
     note = {"provider":"","detail":""}
-    # Primär: Alpaca
+
     if CONFIG.data_provider.lower() == "alpaca":
-        df = fetch_alpaca_ohlcv(symbol, interval, lookback_days)
-        if not df.empty:
-            note.update(provider=f"Alpaca ({ALPACA_DATA_FEED})", detail=interval)
-            return df, note
-        note.update(provider=f"Alpaca→Yahoo", detail="Alpaca leer; versuche Yahoo")
+        if interval.lower() in {"1h","60m"} and CONFIG.align_hourly_to_half:
+            # TV-Sync: 1m -> 1h (:30) -> optional RTH -> letzte Bar droppen
+            df_min = fetch_alpaca_minutes(symbol, lookback_days, feed=os.getenv("APCA_DATA_FEED","sip"))
+            if not df_min.empty:
+                if CONFIG.rth_only:
+                    df_min = filter_us_rth_minutes(df_min)
+                df = resample_to_hourly_halfhour(df_min)
+                if CONFIG.drop_last_incomplete:
+                    df = drop_incomplete_last(df)
+                if not df.empty:
+                    note.update(provider=f"Alpaca ({os.getenv('APCA_DATA_FEED','sip')}) TV-sync",
+                                detail="1m→1h @ xx:30, RTH" if CONFIG.rth_only else "1m→1h @ xx:30")
+                    return df, note
+            # falls leer -> weiter unten auf Yahoo/Stooq fallen
+            note.update(provider="Alpaca→Fallback", detail="minute tv-sync empty")
+        else:
+            # dein bisheriger Alpaca 1h/1d fetch…
+            df = fetch_alpaca_ohlcv(symbol, interval, lookback_days)
+            if not df.empty:
+                note.update(provider=f"Alpaca ({os.getenv('APCA_DATA_FEED','sip')})", detail=interval)
+                return df, note
+            note.update(provider="Alpaca→Fallback", detail="empty")
+
+    # ... dein bisheriger Yahoo + Stooq Fallback bleibt unverändert ...
+    # (lass deinen restlichen Code hier, damit andere Intervalle weiter funktionieren)
+    # return df, note (wie gehabt)
 
     # Yahoo
     intraday_set = {"1m","2m","5m","15m","30m","60m","90m","1h"}
@@ -317,14 +426,11 @@ def bar_logic_last(df: pd.DataFrame, cfg: StratConfig, sym: str) -> Dict[str,Any
         since = df[df["time"] >= pd.to_datetime(entry_time, utc=True)]
         bars_in_trade = max(0, len(since)-1)
 
-    if size==0:
-        if entry_cond:
-            q = 1
-            return {"action":"buy","symbol":sym,"qty":q,"px":price_open,"time":str(ts),
-                    "sl":sl(price_open),"tp":tp(price_open),"reason":"rule_entry",
-                    "rsi":float(last["rsi"]), "efi":float(last["efi"])}
-        return {"action":"none","symbol":sym,"reason":"flat_no_entry",
-                "rsi":float(last["rsi"]), "efi":float(last["efi"])}
+    if size == 0 and entry_cond:
+    q = compute_order_qty(sym, price_open, cfg.slPerc)  # <— Sizer hier!
+    return {"action":"buy","symbol":sym,"qty":q,"px":price_open,"time":str(ts),
+            "sl":sl(price_open),"tp":tp(price_open),"reason":"rule_entry",
+            "rsi":float(last["rsi"]),"efi":float(last["efi"])}
     else:
         same_bar_ok = cfg.allowSameBarExit or (bars_in_trade>0)
         cooldown_ok = (bars_in_trade>=cfg.minBarsInTrade)
@@ -345,6 +451,65 @@ def bar_logic_last(df: pd.DataFrame, cfg: StratConfig, sym: str) -> Dict[str,Any
                     "rsi":float(last["rsi"]), "efi":float(last["efi"])}
         return {"action":"none","symbol":sym,"reason":"hold",
                 "rsi":float(last["rsi"]), "efi":float(last["efi"])}
+
+
+def get_equity_for_sizing() -> float:
+    acc = alpaca_account()
+    if acc and "equity" in acc:
+        try:
+            return float(acc["equity"])
+        except:
+            pass
+    # Fallback: geschätztes Equity aus Sim-Pos (grob)
+    eq = 10000.0
+    for p in STATE.positions.values():
+        if p["size"] > 0 and p["avg"] > 0:
+            eq += p["size"] * p["avg"]
+    return eq
+
+
+def compute_order_qty(symbol: str, entry_px: float, slPerc: float) -> int:
+    """
+    Sizer-Modi:
+      - shares:         qty = sizing_value
+      - percent_equity: qty = floor( equity * (sizing_value/100) / entry_px )
+      - notional_usd:   qty = floor( sizing_value / entry_px )
+      - risk:           qty = floor( (equity * (sizing_value/100)) / (entry_px * slPerc/100) )
+                         (max_position_pct begrenzt Positionsnotional)
+    """
+    mode = (CONFIG.sizing_mode or "percent_equity").lower()
+    val  = float(CONFIG.sizing_value)
+    eq   = max(1.0, get_equity_for_sizing())
+    qty = 1
+
+    if mode == "shares":
+        qty = max(1, int(val))
+
+    elif mode == "percent_equity":
+        notional = eq * (val/100.0)
+        cap = eq * (CONFIG.max_position_pct/100.0)
+        notional = min(notional, cap)
+        qty = max(1, int(notional // max(0.01, entry_px)))
+
+    elif mode == "notional_usd":
+        notional = min(val, eq * (CONFIG.max_position_pct/100.0))
+        qty = max(1, int(notional // max(0.01, entry_px)))
+
+    elif mode == "risk":
+        per_trade_risk = eq * (val/100.0)  # z.B. 1% risk of equity
+        per_share_risk = entry_px * (slPerc/100.0)
+        if per_share_risk <= 0:
+            qty = max(1, int((eq * (CONFIG.max_position_pct/100.0)) // max(0.01, entry_px)))
+        else:
+            qty = int(per_trade_risk // per_share_risk)
+            # zusätzlich Kappung per max_position_pct
+            max_shares_by_cap = int((eq * (CONFIG.max_position_pct/100.0)) // max(0.01, entry_px))
+            qty = max(1, min(qty, max_shares_by_cap))
+    else:
+        # Fallback
+        qty = max(1, int(eq // max(1.0, entry_px)))
+
+    return qty
 
 # ========= Telegram helpers =========
 tg_app: Optional[Application] = None
@@ -572,17 +737,20 @@ def backtest_simple(f: pd.DataFrame, cfg: StratConfig) -> Dict[str, Any]:
         row, prev = f.iloc[i], f.iloc[i-1]
         entry = bool(row["entry_cond"])
         exitc = bool(row["exit_cond"])
-        if pos==0 and entry:
-            pos=1; avg=float(row["open"]); entries+=1
-        elif pos==1:
-            sl = avg*(1-cfg.slPerc/100); tp = avg*(1+cfg.tpPerc/100)
-            price = float(row["close"])
-            stop = price<=sl; take=price>=tp
-            if exitc or stop or take:
-                px = sl if stop else tp if take else float(row["open"])
-                r = (px-avg)/avg
-                eq *= (1+r); R.append(r); exits+=1
-                pos=0; avg=0.0
+        if pos == 0 and entry:
+    entry_px = float(row["open"])
+    qty = compute_order_qty(sym, entry_px, CONFIG.slPerc)
+    pos = qty
+    avg = entry_px
+    entries += 1
+elif pos > 0:
+    # SL/TP/Exit wie gehabt; beim Exit die Performance mit qty berücksichtigen:
+    r = (px - avg) / avg
+    # Equity-Update multiplicativ bleibt ok (da wir %Rendite auf eingesetztes Kapital rechnen).
+    eq *= (1 + r)
+    R.append(r)
+    pos = 0; avg = 0.0
+    exits += 1
     res = {"trades": entries, "exits": exits, "equity": eq}
     if R:
         a = np.array(R)
