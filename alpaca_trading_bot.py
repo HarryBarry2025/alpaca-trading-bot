@@ -469,14 +469,13 @@ def size_from_sizer(symbol: str, price: float, stop_px: Optional[float]) -> int:
     elif mode == "risk":
         # risk in % of equity; needs stop price
         if stop_px is None or stop_px <= 0:
-            # fallback to 1 share
             qty = 1
         else:
             risk_notional = eq * (val/100.0)
             per_share_risk = max(1e-9, abs(price - stop_px))
             qty = int(max(1, math.floor(risk_notional / per_share_risk)))
             # cap by max_notional
-            qty = int(min(qty, math.floor(max_notional / max(1e-9, price)))))
+            qty = int(min(qty, math.floor(max_notional / max(1e-9, price))))
     else:
         qty = 1
 
