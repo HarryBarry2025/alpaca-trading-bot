@@ -1,4 +1,18 @@
-# alpaca_trading_bot.py  — V5 (TV-sync, PDT, Trader-Sizer, Intrabar SL/TP, WF)
+# -*- coding: utf-8 -*-
+# ========================= alpaca_trading_bot.py (V5.1) =========================
+# Features:
+# - TV-synced 1h bars from Alpaca 1m (anchor :30 UTC, RTH only, no last partial)
+# - RSI (Wilder-RMA) + EFI(EMA(vol*Δclose)) — TV-kompatibel
+# - Entry: rsiLow <= RSI < rsiHigh  & RSI rising & EFI rising  (rsiLow default 0)
+# - Exit : RSI < rsiExit  (RSI falling in Signalanzeige, für Exit-Flag)
+# - SL/TP, intrabar-ähnliche Prüfung end-of-bar (EoB) auf last close
+# - Intraday-strict: kein EOD-Fallback für 1h; statt dessen Cache (/mnt/data/*.parquet)
+# - PDT-Persistenz (/mnt/data/pdt_trades.json) mit Hard-Block (≥3 Daytrades in 5 BizDays)
+# - Trader-Sizer: shares | percent_equity | notional_usd | risk
+# - Timer: synct auf 30min-Offsets bei 1h; market_hours_only optional
+# - Backtest + Walk-Forward (/bt, /wf) inkl. Slippage & Fees
+# - Telegram-Befehle vollständig
+# ===============================================================================
 import os, io, json, time, asyncio, traceback, warnings, math
 from datetime import datetime, timedelta, timezone, date
 from contextlib import asynccontextmanager
@@ -22,60 +36,33 @@ from telegram.error import Conflict, BadRequest
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# ========= ENV & Defaults =========
+# ============================ ENV & Defaults ============================
 BOT_TOKEN       = os.getenv("TELEGRAM_BOT_TOKEN", "")
 DEFAULT_CHAT_ID = os.getenv("DEFAULT_CHAT_ID", "") or None
 if not BOT_TOKEN:
     raise RuntimeError("Set TELEGRAM_BOT_TOKEN env var")
 
-# Alpaca
+# Alpaca credentials (Paper; Market Data uses separate key pair)
 APCA_API_KEY_ID     = os.getenv("APCA_API_KEY_ID", "")
 APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY", "")
-APCA_DATA_FEED      = os.getenv("APCA_DATA_FEED", "sip").lower()  # "sip" (empfohlen) oder "iex"
+APCA_DATA_FEED      = os.getenv("APCA_DATA_FEED", "iex").lower()  # 'iex' (default) or 'sip'
 
-# Timer/Trading Defaults
+# Toggles
 ENV_ENABLE_TRADE       = os.getenv("ENABLE_TRADE", "false").lower() in ("1","true","on","yes")
-ENV_ENABLE_TIMER       = os.getenv("ENABLE_TIMER", "true").lower() in ("1","true","on","yes")
+ENV_ENABLE_TIMER       = os.getenv("ENABLE_TIMER", "false").lower() in ("1","true","on","yes")
 ENV_POLL_MINUTES       = int(os.getenv("POLL_MINUTES", "10"))
 ENV_MARKET_HOURS_ONLY  = os.getenv("MARKET_HOURS_ONLY", "true").lower() in ("1","true","on","yes")
 
-# Persistenz-Dateien
-PDT_FILE = "/mnt/data/pdt_trades.json"
-
-# ========= Utility: US-Business-Days =========
-US_HOLIDAYS = {
-    # Beispiel-Sets (erweitern/aktualisieren nach Bedarf)
-    "2024-01-01","2024-01-15","2024-02-19","2024-03-29","2024-05-27","2024-06-19","2024-07-04",
-   "2024-09-02","2024-11-28","2024-12-25",
-    "2025-01-01","2025-01-20","2025-02-17","2025-04-18","2025-05-26","2025-06-19","2025-07-04",
-   "2025-09-01","2025-11-27","2025-12-25",
-}
-def is_us_business_day(d: date) -> bool:
-    if d.strftime("%Y-%m-%d") in US_HOLIDAYS: return False
-    return d.weekday() < 5
-
-def last_n_business_days(n: int, ref: Optional[date] = None) -> List[date]:
-    ref = ref or datetime.now(timezone.utc).date()
-    out=[]
-    cur = ref
-    while len(out)<n:
-        if is_us_business_day(cur): out.append(cur)
-        cur -= timedelta(days=1)
-    return out
-
-# ========= Strategy Config / State =========
+# ============================ Config / State ============================
 class StratConfig(BaseModel):
     # Engine
     symbols: List[str] = ["TQQQ"]
-    interval: str = "1h"             # '1h' oder '1d'
+    interval: str = "1h"                 # '1h' oder '1d' (intraday strict gilt für 1h)
     lookback_days: int = 365
-    drop_last_incomplete: bool = True
-    rth_only: bool = True            # nur Regular Trading Hours (NY 9:30–16:00)
-    tv_anchor_halfhour: bool = True  # 1h-Bars bei :30 UTC schließen
 
-    # Indikatoren (TV-kompatibel)
+    # TV-kompatible Inputs
     rsiLen: int = 12
-    rsiLow: float = 0.0              # Default=0 (gewünscht)
+    rsiLow: float = 0.0                  # default 0 (gewünscht)
     rsiHigh: float = 68.0
     rsiExit: float = 48.0
     efiLen: int = 11
@@ -85,194 +72,196 @@ class StratConfig(BaseModel):
     tpPerc: float = 4.0
     allowSameBarExit: bool = False
     minBarsInTrade: int = 0
-    intrabar_risk_check: bool = True  # SL/TP intrabar via High/Low
 
     # Live Scheduler
     poll_minutes: int = ENV_POLL_MINUTES
     live_enabled: bool = False
     market_hours_only: bool = ENV_MARKET_HOURS_ONLY
-    timer_sync_to_candle: bool = True # Timer mit Candle-Anker synchronisieren
+    sync_half_hour: bool = True          # 1h bei :30, TV-like
 
     # Data Provider
-    data_provider: str = "alpaca"    # "alpaca" | "yahoo" | "stooq_eod"
-    yahoo_retries: int = 3
-    yahoo_backoff_sec: float = 2.0
-    allow_stooq_fallback: bool = True
+    data_provider: str = "alpaca"        # primary
+    yahoo_retries: int = 2
+    yahoo_backoff_sec: float = 1.0
+    allow_stooq_fallback: bool = True    # nur für 1d sinnvoll
+
+    # Intraday policy
+    intraday_strict: bool = True         # bei 1h niemals EOD fallback
+    cache_intraday: bool = True          # 1h TV-bars cachen
 
     # Trading Toggle
     trade_enabled: bool = ENV_ENABLE_TRADE
 
     # Trader Sizer
-    sizing_mode: str = "shares"      # 'shares'|'percent_equity'|'notional_usd'|'risk'
-    sizing_value: float = 1.0
-    max_position_pct: float = 100.0  # maximale Position in % vom Equity
+    sizing_mode: str = "shares"          # shares | percent_equity | notional_usd | risk
+    sizing_value: float = 1.0            # je nach Modus: #shares, %, $, oder %Risk
+    max_position_pct: float = 100.0      # 0..100
 
-    # Backtest/Walk-Forward
-    bt_slippage_bp: float = 0.0      # Slippage in Basispunkten (1bp=0.01%)
-    bt_fee_perc: float = 0.0         # Fee als % pro Trade (Roundtrip approx)
-
-    # PDT
-    pdt_hard_stop: bool = True       # harte Blockade neuer Daytrades
-    pdt_max_daytrades_5bd: int = 3   # Non-PDT: max 3 DT in 5 Business Days
+    # Backtest frictions
+    bt_slippage_bps: float = 0.0         # 1bp = 0.01%
+    bt_fee_per_trade: float = 0.0
 
 class StratState(BaseModel):
     positions: Dict[str, Dict[str, Any]] = {}  # {symbol: {"size":int,"avg":float,"entry_time":str|None}}
     last_status: str = "idle"
-    data_feed: str = APCA_DATA_FEED
 
 CONFIG = StratConfig()
 STATE  = StratState()
 CHAT_ID: Optional[str] = DEFAULT_CHAT_ID
 
-# ========= Indicators (TV-kompatibel) =========
+# ============================ TV Indicators ============================
 def ema(s: pd.Series, n: int) -> pd.Series:
     return s.ewm(span=n, adjust=False).mean()
 
-def rsi_tv_wilder(s: pd.Series, length: int = 14) -> pd.Series:
-    delta = s.diff()
+def rsi_tv_wilder(close: pd.Series, length: int = 14) -> pd.Series:
+    # ta.rma = Wilder smoothing (RMA)
+    delta = close.diff()
     up = delta.clip(lower=0.0)
     down = (-delta).clip(lower=0.0)
     alpha = 1.0 / length
     roll_up = up.ewm(alpha=alpha, adjust=False).mean()
     roll_down = down.ewm(alpha=alpha, adjust=False).mean()
     rs = roll_up / (roll_down + 1e-12)
-    return 100 - (100/(1+rs))
+    return 100.0 - (100.0/(1.0 + rs))
 
 def efi_tv(close: pd.Series, vol: pd.Series, length: int) -> pd.Series:
     raw = vol * (close - close.shift(1))
     return ema(raw, length)
 
-# ========= Alpaca Clients =========
-def alpaca_data_client():
+# ============================ Market Hours =============================
+# Grob (UTC): Mo-Fr, 13:30–20:00 (RTH); Feiertage Liste (Beispiele)
+US_HOLIDAYS = {
+    "2024-01-01","2024-01-15","2024-02-19","2024-03-29","2024-05-27",
+    "2024-06-19","2024-07-04","2024-09-02","2024-11-28","2024-12-25",
+    "2025-01-01","2025-01-20","2025-02-17","2025-04-18","2025-05-26",
+    "2025-06-19","2025-07-04","2025-09-01","2025-11-27","2025-12-25",
+}
+
+def is_market_open_now(dt_utc: Optional[datetime] = None) -> bool:
+    now = dt_utc or datetime.now(timezone.utc)
+    if now.strftime("%Y-%m-%d") in US_HOLIDAYS: return False
+    if now.weekday() >= 5: return False
+    hhmm = now.hour*60 + now.minute
+    return 13*60+30 <= hhmm <= 20*60
+
+def is_rth_minute(ts_utc: pd.Timestamp) -> bool:
+    d = ts_utc.to_pydatetime().replace(tzinfo=timezone.utc)
+    if d.strftime("%Y-%m-%d") in US_HOLIDAYS: return False
+    if d.weekday() >= 5: return False
+    hhmm = d.hour*60 + d.minute
+    return 13*60+30 <= hhmm <= 20*60
+
+# ============================ Cache Helpers ============================
+def _cache_path(symbol: str, key: str) -> str:
+    safe = f"{symbol.replace('/','_')}_{key}"
+    return f"/mnt/data/cache_{safe}.parquet"
+
+def cache_save_df(symbol: str, key: str, df: pd.DataFrame):
+    if df is None or df.empty: return
     try:
-        from alpaca.data.historical import StockHistoricalDataClient
-        if not (APCA_API_KEY_ID and APCA_API_SECRET_KEY):
-            return None
-        return StockHistoricalDataClient(APCA_API_KEY_ID, APCA_API_SECRET_KEY)
+        os.makedirs("/mnt/data", exist_ok=True)
+        df.to_parquet(_cache_path(symbol, key))
     except Exception as e:
-        print("[alpaca-data] error:", e)
-        return None
+        print("[cache] save error:", e)
 
-def alpaca_trading_client():
+def cache_load_df(symbol: str, key: str) -> pd.DataFrame:
     try:
-        from alpaca.trading.client import TradingClient
-        if not (APCA_API_KEY_ID and APCA_API_SECRET_KEY):
-            return None
-        return TradingClient(APCA_API_KEY_ID, APCA_API_SECRET_KEY, paper=True)
+        path = _cache_path(symbol, key)
+        if os.path.exists(path):
+            df = pd.read_parquet(path)
+            if isinstance(df.index, pd.DatetimeIndex):
+                df.index = df.index.tz_localize("UTC") if df.index.tz is None else df.index.tz_convert("UTC")
+            return df
     except Exception as e:
-        print("[alpaca-trading] error:", e)
-        return None
+        print("[cache] load error:", e)
+    return pd.DataFrame()
 
-# ========= TV-sync 1-Minute → 1h Bars (RTH, :30-UTC-Anker) =========
-def floor_to_half_hour_utc(ts: pd.Timestamp) -> pd.Timestamp:
-    # runde ab auf :30 oder :00 – TV-Anker: Bars enden bei :30, also Buckets [:30–:30)
-    ts = ts.tz_convert("UTC")
-    mm = 30 if ts.minute >= 30 else 0
-    return ts.replace(minute=mm, second=0, microsecond=0)
+# ============================ PDT Persistence ==========================
+PDT_JSON = "/mnt/data/pdt_trades.json"
 
-def resample_1m_to_1h_tv_sync(df1m: pd.DataFrame, drop_last_incomplete: bool = True) -> pd.DataFrame:
-    """
-    Erwartet 1-min Bars in UTC. Baut 1h-Bars, die immer bei **:30 UTC** enden:
-    Buckets: 13:30–14:30, 14:30–15:30, ...
-    Außerdem RTH-Filter: 13:30–20:00 UTC (9:30–16:00 ET).
-    """
-    if df1m.empty: return df1m
-    df = df1m.copy()
+def pdt_load() -> Dict[str, Any]:
+    try:
+        if os.path.exists(PDT_JSON):
+            with open(PDT_JSON, "r") as f:
+                return json.load(f)
+    except Exception as e:
+        print("[pdt] load error:", e)
+    return {"daytrades": []}  # list of ISO dates (YYYY-MM-DD)
 
-    # nur RTH
-    if CONFIG.rth_only:
-        idx = df.index.tz_convert("UTC")
-        minutes = idx.hour * 60 + idx.minute
-        mask = (minutes >= (13*60+30)) & (minutes <= (20*60))
-        df = df.loc[mask]
-        if df.empty: return df
+def pdt_save(data: Dict[str,Any]):
+    try:
+        os.makedirs("/mnt/data", exist_ok=True)
+        with open(PDT_JSON, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print("[pdt] save error:", e)
 
-    # Hilfsindex: "Endzeit" pro 1m-Bar auf :30-Raster
-    # Wir lassen 1h-Kerzen bei :30 enden => jede Minute bekommt den nächsten :30-Zeitstempel als "close_bucket"
-    idx = df.index.tz_convert("UTC")
-    close_bucket = []
-    for ts in idx:
-        base = floor_to_half_hour_utc(ts)
-        if ts >= base:
-            # Minute gehört zur Periode (base .. base+1h]
-            bucket_end = base + timedelta(hours=1)
-        else:
-            # theoretisch nicht nötig
-            bucket_end = base
-        close_bucket.append(bucket_end)
-    df = df.copy()
-    df["bucket_end"] = close_bucket
-
-    # Resample by bucket_end (Groupby)
-    gb = df.groupby("bucket_end")
-    out = pd.DataFrame({
-        "open": gb["open"].first(),
-        "high": gb["high"].max(),
-        "low": gb["low"].min(),
-        "close": gb["close"].last(),
-        "volume": gb["volume"].sum()
-    })
-    out.index = pd.to_datetime(out.index).tz_localize("UTC")
-
-    # unvollständige letzte Kerze droppen
-    if drop_last_incomplete:
-        # "jetzt" zur nächsten :30 Runde
-        now = datetime.now(timezone.utc)
-        cur_bucket_end = floor_to_half_hour_utc(pd.Timestamp(now, tz="UTC")) + timedelta(hours=1)
-        if len(out)>0 and out.index[-1] >= cur_bucket_end:
-            out = out.iloc[:-1]
-
-    out["time"] = out.index
+def business_days_range(end: date, days: int) -> List[date]:
+    out=[]; cur=end
+    while len(out) < days:
+        if cur.weekday() < 5 and cur.strftime("%Y-%m-%d") not in US_HOLIDAYS:
+            out.append(cur)
+        cur = cur - timedelta(days=1)
     return out
 
-# ========= Data Providers =========
-from urllib.parse import quote
+def pdt_count_last5bizdays() -> int:
+    data = pdt_load()
+    today = datetime.now(timezone.utc).date()
+    last5 = set(d.strftime("%Y-%m-%d") for d in business_days_range(today, 5))
+    return sum(1 for d in data.get("daytrades", []) if d in last5)
 
-def fetch_stooq_daily(symbol: str, lookback_days: int) -> pd.DataFrame:
-    stooq_sym = f"{symbol.lower()}.us"
-    url = f"https://stooq.com/q/d/l/?s={quote(stooq_sym)}&i=d"
+def pdt_register_if_daytrade(entry_ts_iso: Optional[str], exit_ts_iso: Optional[str]):
+    if not entry_ts_iso or not exit_ts_iso: return
     try:
-        df = pd.read_csv(url)
-        if df is None or df.empty: return pd.DataFrame()
-        df.columns = [c.lower() for c in df.columns]
-        df["date"] = pd.to_datetime(df["date"])
-        df = df.set_index("date").sort_index()
-        if lookback_days > 0:
-            df = df.iloc[-lookback_days:]
-        df["time"] = df.index.tz_localize("UTC")
-        return df
-    except Exception as e:
-        print("[stooq] fetch failed:", e)
-        return pd.DataFrame()
+        e = datetime.fromisoformat(entry_ts_iso.replace("Z","+00:00")).astimezone(timezone.utc).date()
+        x = datetime.fromisoformat(exit_ts_iso.replace("Z","+00:00")).astimezone(timezone.utc).date()
+        if e == x:
+            data = pdt_load()
+            iso = e.strftime("%Y-%m-%d")
+            data.setdefault("daytrades", [])
+            data["daytrades"].append(iso)
+            # dedupe + keep last 50
+            data["daytrades"] = data["daytrades"][-50:]
+            pdt_save(data)
+    except Exception as ex:
+        print("[pdt] register error:", ex)
 
+def pdt_hard_block_active() -> bool:
+    return pdt_count_last5bizdays() >= 3
+
+# ============================ Data Providers ===========================
 def fetch_alpaca_1m(symbol: str, lookback_days: int) -> pd.DataFrame:
     try:
+        from alpaca.data.historical import StockHistoricalDataClient
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
     except Exception as e:
-        print("[alpaca] library not available:", e)
+        print("[alpaca] data lib missing:", e)
         return pd.DataFrame()
 
-    client = alpaca_data_client()
-    if client is None:
-        return pd.DataFrame()
+    if not (APCA_API_KEY_ID and APCA_API_SECRET_KEY):
+        print("[alpaca] missing API keys"); return pd.DataFrame()
 
+    client = StockHistoricalDataClient(APCA_API_KEY_ID, APCA_API_SECRET_KEY)
     end   = datetime.now(timezone.utc)
-    start = end - timedelta(days=max(lookback_days, 10))
+    start = end - timedelta(days=max(lookback_days, 14))
+
+    req = StockBarsRequest(
+        symbol_or_symbols=symbol,
+        timeframe=TimeFrame(1, TimeFrameUnit.Minute),
+        start=start,
+        end=end,
+        feed=APCA_DATA_FEED,  # 'iex' or 'sip'
+        limit=50000
+    )
     try:
-        req = StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=TimeFrame(1, TimeFrameUnit.Minute),
-            start=start, end=end,
-            feed=("SIP" if APCA_DATA_FEED=="sip" else "IEX"),
-            limit=50000
-        )
         bars = client.get_stock_bars(req)
         if not bars or bars.df is None or bars.df.empty:
-            return pd.DataFrame()
+            print("[alpaca] 1m empty"); return pd.DataFrame()
         df = bars.df.copy()
         if isinstance(df.index, pd.MultiIndex):
-            df = df.xs(symbol, level=0)
+            try: df = df.xs(symbol, level=0)
+            except Exception: pass
         if not isinstance(df.index, pd.DatetimeIndex):
             df.index = pd.to_datetime(df.index)
         df.index = df.index.tz_convert("UTC") if df.index.tz is not None else df.index.tz_localize("UTC")
@@ -280,132 +269,152 @@ def fetch_alpaca_1m(symbol: str, lookback_days: int) -> pd.DataFrame:
         df["time"] = df.index
         return df[["open","high","low","close","volume","time"]]
     except Exception as e:
-        print("[alpaca 1m] fetch failed:", e)
+        print("[alpaca] 1m fetch failed:", e)
         return pd.DataFrame()
 
-def fetch_yahoo(symbol: str, interval: str, lookback_days: int) -> pd.DataFrame:
-    intraday_set = {"1m","2m","5m","15m","30m","60m","90m","1h"}
-    is_intraday = interval in intraday_set
-    period = f"{min(lookback_days, 730)}d" if is_intraday else f"{lookback_days}d"
+def aggregate_tv_1h_from_1m(df1m: pd.DataFrame, drop_last_incomplete: bool = True) -> pd.DataFrame:
+    """RTH-only, 1h bars, anchored at :30, TV-like (label/closed 'right')."""
+    if df1m.empty: return df1m
+    # Filter RTH minutes
+    mask = df1m.index.map(lambda ts: is_rth_minute(pd.Timestamp(ts, tz="UTC")))
+    dfr = df1m.loc[mask].copy()
+    if dfr.empty: return pd.DataFrame()
 
-    def _norm(df: pd.DataFrame) -> pd.DataFrame:
+    # Resample: 60T with 30min offset, closed='right' -> bar [t-60,t)
+    # pandas >=1.1 supports offset param
+    rs = dfr.resample("60T", offset="30min", label="right", closed="right").agg({
+        "open":"first","high":"max","low":"min","close":"last","volume":"sum"
+    }).dropna(subset=["open","high","low","close"])
+
+    # Drop last incomplete (ensure full hour inside RTH)
+    if drop_last_incomplete and not rs.empty:
+        now = datetime.now(timezone.utc)
+        last_idx = rs.index[-1]
+        # A bar is complete if last_idx <= floor_to_half_hour(now) (previous boundary)
+        # Next scheduled boundary:
+        mins = now.minute
+        # next boundary by :30/:00
+        next_boundary = now.replace(second=0, microsecond=0)
+        if mins < 30:
+            next_boundary = next_boundary.replace(minute=30)
+        else:
+            next_boundary = (next_boundary + timedelta(hours=1)).replace(minute=30)
+        if last_idx >= pd.Timestamp(next_boundary, tz=timezone.utc):
+            rs = rs.iloc[:-1]
+
+    rs["time"] = rs.index
+    return rs
+
+def fetch_stooq_daily(symbol: str, lookback_days: int) -> pd.DataFrame:
+    from urllib.parse import quote
+    url = f"https://stooq.com/q/d/l/?s={quote(symbol.lower()+'.us')}&i=d"
+    try:
+        df = pd.read_csv(url)
         if df is None or df.empty: return pd.DataFrame()
-        df = df.rename(columns=str.lower)
-        if isinstance(df.columns, pd.MultiIndex):
-            try: df = df.xs(symbol, axis=1)
-            except Exception: pass
+        df.columns = [c.lower() for c in df.columns]
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").sort_index()
+        if lookback_days > 0: df = df.iloc[-lookback_days:]
+        df["time"] = df.index.tz_localize("UTC")
+        return df[["open","high","low","close","volume","time"]]
+    except Exception as e:
+        print("[stooq] fetch failed:", e); return pd.DataFrame()
+
+def fetch_yahoo(symbol: str, interval: str, lookback_days: int) -> pd.DataFrame:
+    # For 60m: Yahoo bars anchor often on :00 — we can accept as fallback only
+    intraday = interval.lower() in {"60m","1h","30m","15m","5m","1m"}
+    period = f"{min(lookback_days, 730)}d" if intraday else f"{lookback_days}d"
+    last_err=None
+    def _norm(tmp):
+        if tmp is None or tmp.empty: return pd.DataFrame()
+        df = tmp.rename(columns=str.lower)
         idx = df.index
         if isinstance(idx, pd.DatetimeIndex):
-            try:
-                df.index = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
-            except Exception:
-                pass
-        df = df.sort_index()
-        df["time"] = df.index
+            try: df.index = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+            except: pass
+        df = df.sort_index(); df["time"] = df.index
         return df
 
     tries = [
-        ("download", dict(tickers=symbol, interval=("60m" if interval=="1h" else interval),
-                          period=period, auto_adjust=False, progress=False, prepost=False, threads=False)),
-        ("download", dict(tickers=symbol, interval=("60m" if interval=="1h" else interval),
-                          period=period, auto_adjust=False, progress=False, prepost=True, threads=False)),
-        ("history",  dict(period=period, interval=("60m" if interval=="1h" else interval),
-                          auto_adjust=False, prepost=True)),
+        ("download", dict(tickers=symbol, interval=interval, period=period,
+                          auto_adjust=False, progress=False, prepost=False, threads=False)),
+        ("download", dict(tickers=symbol, interval=interval, period=period,
+                          auto_adjust=False, progress=False, prepost=True, threads=False)),
+        ("history",  dict(period=period, interval=interval, auto_adjust=False, prepost=True)),
     ]
-    last_err=None
     for method, kwargs in tries:
         for attempt in range(1, CONFIG.yahoo_retries+1):
             try:
                 tmp = yf.download(**kwargs) if method=="download" else yf.Ticker(symbol).history(**kwargs)
                 df = _norm(tmp)
-                if not df.empty:
-                    return df
+                if not df.empty: return df
             except Exception as e:
                 last_err = e
             time.sleep(CONFIG.yahoo_backoff_sec * (2**(attempt-1)))
-
-    # 1d fallback
+    # Fallback daily
     try:
-        tmp = yf.download(symbol, interval="1d", period=f"{max(lookback_days, 60)}d",
+        tmp = yf.download(symbol, interval="1d", period=f"{max(lookback_days,60)}d",
                           auto_adjust=False, progress=False, prepost=False, threads=False)
         df = _norm(tmp)
-        if not df.empty:
-            return df
+        if not df.empty: return df
     except Exception as e:
         last_err = e
-
-    print("[yahoo] failed:", last_err)
-    return pd.DataFrame()
+    print("[yahoo] empty:", last_err); return pd.DataFrame()
 
 def fetch_ohlcv_tv_sync(symbol: str, interval: str, lookback_days: int) -> Tuple[pd.DataFrame, Dict[str,str]]:
-    """
-    Primär: Alpaca 1m → TV-synchrone 1h RTH; Sekundär: Yahoo 60m → (optional) auf TV-Anker anpassen; Tertiär: Stooq daily
-    """
+    """Returns TV-compatible bars (1h via Alpaca 1m -> :30 anchor, RTH, no incomplete)."""
     note = {"provider":"", "detail":""}
-
-    if interval == "1h":
-        # 1) Alpaca 1m and resample
-        if CONFIG.data_provider.lower() == "alpaca":
-            m1 = fetch_alpaca_1m(symbol, lookback_days)
-            if not m1.empty:
-                h1 = resample_1m_to_1h_tv_sync(m1, drop_last_incomplete=CONFIG.drop_last_incomplete)
-                if not h1.empty:
-                    note.update(provider=f"Alpaca ({APCA_DATA_FEED})", detail="1h TV-sync from 1m")
-                    return h1, note
-            # -> Fallback
-            note.update(provider=f"Alpaca→Yahoo", detail="fallback 60m")
-
-        # 2) Yahoo 60m (nicht perfekt TV-ankert, aber nutzbar)
-        yh = fetch_yahoo(symbol, "1h", lookback_days)
-        if not yh.empty:
-            # RTH grob filtern + letzte halbe Bar droppen (best effort)
-            if CONFIG.rth_only:
-                idx = yh.index.tz_convert("UTC")
-                minutes = idx.hour*60 + idx.minute
-                mask = (minutes >= (13*60+30)) & (minutes <= (20*60))
-                yh = yh.loc[mask]
-            if CONFIG.drop_last_incomplete and len(yh)>0:
-                # heuristik: letzte Kerze in Zukunft?
-                now = datetime.now(timezone.utc)
-                last_ts = yh.index[-1]
-                if last_ts > now:
-                    yh = yh.iloc[:-1]
-            yh["time"] = yh.index
-            note.update(provider="Yahoo (60m)", detail="approx TV-sync")
+    if interval.lower() in {"1h","60m"}:
+        # Primary: Alpaca 1m -> aggregate
+        m1 = fetch_alpaca_1m(symbol, lookback_days)
+        if not m1.empty:
+            h1 = aggregate_tv_1h_from_1m(m1, drop_last_incomplete=True)
+            if not h1.empty:
+                if CONFIG.cache_intraday:
+                    cache_save_df(symbol, "1h_tv", h1)
+                note.update(provider=f"Alpaca ({APCA_DATA_FEED})", detail="1h TV-sync (:30, RTH)")
+                return h1, note
+        # Yahoo fallback (intraday) — may be off-anchored; use only if strict disabled
+        yh = fetch_yahoo(symbol, "60m", lookback_days)
+        if not yh.empty and not CONFIG.intraday_strict:
+            if CONFIG.cache_intraday:
+                cache_save_df(symbol, "1h_tv", yh)
+            note.update(provider="Yahoo", detail="60m (fallback)")
             return yh, note
 
-        # 3) Stooq EOD fallback
+        # STRICT: no EOD fallback; try cache
+        if CONFIG.intraday_strict:
+            if CONFIG.cache_intraday:
+                cached = cache_load_df(symbol, "1h_tv")
+                if not cached.empty:
+                    note.update(provider="CACHE (last 1h TV-sync)", detail="no fresh intraday data")
+                    return cached, note
+            return pd.DataFrame(), {"provider":"(leer)","detail":"strict 1h; no intraday data"}
+
+        # non-strict: optional EOD fallback
         if CONFIG.allow_stooq_fallback:
-            dfe = fetch_stooq_daily(symbol, max(lookback_days, 120))
+            dfe = fetch_stooq_daily(symbol, max(lookback_days,120))
             if not dfe.empty:
-                note.update(provider="Stooq EOD (Fallback)", detail="1d")
+                note.update(provider="Stooq EOD (Fallback)", detail="1d (not intraday)")
                 return dfe, note
+        return pd.DataFrame(), {"provider":"(leer)","detail":"1h no data"}
 
-        return pd.DataFrame(), {"provider":"(leer)","detail":"no data (1h)"}
+    # 1d path (simple)
+    if CONFIG.data_provider.lower() == "alpaca":
+        # We could fetch Alpaca 1d directly via data client, but Yahoo daily is often fine:
+        pass
+    df = fetch_yahoo(symbol, "1d", lookback_days)
+    if not df.empty:
+        note.update(provider="Yahoo", detail="1d")
+        return df, note
+    if CONFIG.allow_stooq_fallback:
+        dfe = fetch_stooq_daily(symbol, lookback_days)
+        if not dfe.empty:
+            note.update(provider="Stooq EOD (Fallback)", detail="1d")
+            return dfe, note
+    return pd.DataFrame(), {"provider":"(leer)","detail":"no data"}
 
-    else:
-        # 1d direkt von Alpaca oder Yahoo
-        if CONFIG.data_provider.lower() == "alpaca":
-            # Alpaca daily via bars? Nutzen wir Yahoo direkt, um Komplexität gering zu halten.
-            df = fetch_yahoo(symbol, "1d", lookback_days)
-            if not df.empty:
-                note.update(provider="Yahoo", detail="1d")
-                return df, note
-
-        df = fetch_yahoo(symbol, "1d", lookback_days)
-        if not df.empty:
-            note.update(provider="Yahoo", detail="1d")
-            return df, note
-
-        if CONFIG.allow_stooq_fallback:
-            dfe = fetch_stooq_daily(symbol, max(lookback_days, 120))
-            if not dfe.empty:
-                note.update(provider="Stooq EOD (Fallback)", detail="1d")
-                return dfe, note
-
-        return pd.DataFrame(), {"provider":"(leer)","detail":"no data (1d)"}
-
-# ========= Features / Signals =========
+# ============================ Features / Signals =======================
 def build_features(df: pd.DataFrame, cfg: StratConfig) -> pd.DataFrame:
     out = df.copy()
     out["rsi"] = rsi_tv_wilder(out["close"], cfg.rsiLen)
@@ -417,121 +426,132 @@ def compute_signals_for_frame(df: pd.DataFrame, cfg: StratConfig) -> pd.DataFram
     f["rsi_rising"] = f["rsi"] > f["rsi"].shift(1)
     f["rsi_falling"] = f["rsi"] < f["rsi"].shift(1)
     f["efi_rising"] = f["efi"] > f["efi"].shift(1)
-    # Entry/Exit (ohne MACD) — bestätigt
     f["entry_cond"] = (f["rsi"] > cfg.rsiLow) & (f["rsi"] < cfg.rsiHigh) & f["rsi_rising"] & f["efi_rising"]
     f["exit_cond"]  = (f["rsi"] < cfg.rsiExit) & f["rsi_falling"]
     return f
 
-# ========= PDT Persistenz =========
-def load_pdt() -> Dict[str, Any]:
+def build_export_frame(df: pd.DataFrame, cfg: StratConfig) -> pd.DataFrame:
+    f = compute_signals_for_frame(df, cfg)
+    cols = ["open","high","low","close","volume","rsi","efi","rsi_rising","efi_rising","entry_cond","exit_cond","time"]
+    return f[cols]
+
+# ============================ Trader Sizer =============================
+def get_account_equity_cash() -> Tuple[float, float]:
+    # Alpaca trading client for equity/cash (paper)
     try:
-        with open(PDT_FILE, "r") as f:
-            return json.load(f)
+        from alpaca.trading.client import TradingClient
+        if not (APCA_API_KEY_ID and APCA_API_SECRET_KEY):
+            return 10000.0, 10000.0
+        tc = TradingClient(APCA_API_KEY_ID, APCA_API_SECRET_KEY, paper=True)
+        acc = tc.get_account()
+        eq = float(acc.equity)
+        cash = float(acc.cash)
+        return eq, cash
     except Exception:
-        return {"daytrades": []}  # list of {"open": "YYYY-MM-DD", "close": "YYYY-MM-DD"}
+        return 10000.0, 10000.0
 
-def save_pdt(obj: Dict[str,Any]):
-    try:
-        os.makedirs(os.path.dirname(PDT_FILE), exist_ok=True)
-        with open(PDT_FILE, "w") as f:
-            json.dump(obj, f)
-    except Exception as e:
-        print("[pdt] save error:", e)
-
-def register_daytrade(open_dt: datetime, close_dt: datetime):
-    p = load_pdt()
-    p["daytrades"].append({"open": str(open_dt.date()), "close": str(close_dt.date())})
-    # Cleanup: keep last ~200
-    if len(p["daytrades"])>200:
-        p["daytrades"] = p["daytrades"][-200:]
-    save_pdt(p)
-
-def pdt_count_last_5bd(ref: Optional[date] = None) -> int:
-    p = load_pdt()
-    last5 = {d.strftime("%Y-%m-%d") for d in last_n_business_days(5, ref)}
-    cnt=0
-    for tr in p.get("daytrades", []):
-        # Daytrade = open und close am gleichen Kalendertag (US)
-        if tr.get("open")==tr.get("close") and tr["close"] in last5:
-            cnt += 1
-    return cnt
-
-def pdt_block_new_daytrade() -> bool:
-    # harte Blockade, wenn nächste Position potenziell ein Daytrade wäre und Limit bereits erreicht
-    if not CONFIG.pdt_hard_stop: return False
-    # Wir blocken "Entry" wenn in den letzten 5 BD bereits >= pdt_max Daytrades
-    cnt = pdt_count_last_5bd()
-    return cnt >= CONFIG.pdt_max_daytrades_5bd
-
-# ========= Trader Sizer =========
-def alpaca_account_equity() -> Optional[float]:
-    client = alpaca_trading_client()
-    if client is None: return None
-    try:
-        acc = client.get_account()
-        return float(acc.equity)
-    except Exception as e:
-        print("alpaca_account_equity error:", e); return None
-
-def price_of_last(df: pd.DataFrame) -> float:
-    return float(df["close"].iloc[-1])
-
-def position_size_for_signal(sym: str, df: pd.DataFrame) -> int:
+def size_from_sizer(symbol: str, price: float, stop_px: Optional[float]) -> int:
     mode = CONFIG.sizing_mode.lower()
     val  = CONFIG.sizing_value
-    px = price_of_last(df)
-    # Equity-Basis
-    eq = alpaca_account_equity()
-    if eq is None:  # fallback: 10000 für Sizer
-        eq = 10000.0
-    max_shares_by_pct = math.floor((CONFIG.max_position_pct/100.0 * eq) / max(px, 1e-9))
+    eq, cash = get_account_equity_cash()
+    max_notional = eq * (CONFIG.max_position_pct/100.0) if CONFIG.max_position_pct>0 else eq
 
+    qty = 0
     if mode == "shares":
-        qty = int(val)
+        qty = int(max(1, round(val)))
     elif mode == "percent_equity":
-        notional = (val/100.0) * eq
-        qty = max(1, math.floor(notional / max(px, 1e-9)))
+        notional = eq * (val/100.0)
+        notional = min(notional, max_notional)
+        qty = int(max(1, math.floor(notional / max(1e-9, price))))
     elif mode == "notional_usd":
-        qty = max(1, math.floor(val / max(px, 1e-9)))
+        notional = min(val, max_notional)
+        qty = int(max(1, math.floor(notional / max(1e-9, price))))
     elif mode == "risk":
-        # einfacher Risk: val = %Equity, SL-Distanz = slPerc (%)
-        risk_dollars = (val/100.0) * eq
-        sl_dist = CONFIG.slPerc/100.0 * px
-        qty = max(1, math.floor(risk_dollars / max(sl_dist, 1e-9)))
+        # risk in % of equity; needs stop price
+        if stop_px is None or stop_px <= 0:
+            # fallback to 1 share
+            qty = 1
+        else:
+            risk_notional = eq * (val/100.0)
+            per_share_risk = max(1e-9, abs(price - stop_px))
+            qty = int(max(1, math.floor(risk_notional / per_share_risk)))
+            # cap by max_notional
+            qty = int(min(qty, math.floor(max_notional / max(1e-9, price)))))
     else:
         qty = 1
 
-    qty = max(1, min(qty, max_shares_by_pct if max_shares_by_pct>0 else qty))
+    # do not exceed cash (simple)
+    max_cash_qty = int(max(1, math.floor(cash / max(1e-9, price))))
+    qty = max(1, min(qty, max_cash_qty))
     return qty
 
-# ========= Telegram helpers =========
-tg_app: Optional[Application] = None
-POLLING_STARTED = False
+# ============================ Strategy step ============================
+def bar_logic_last(df: pd.DataFrame, cfg: StratConfig, sym: str) -> Dict[str,Any]:
+    if df.empty or len(df) < max(cfg.rsiLen, cfg.efiLen) + 3:
+        return {"action":"none","reason":"not_enough_data","symbol":sym}
 
-async def send_text(chat_id: str, text: str):
-    if tg_app is None: return
-    if not text or not text.strip():
-        text = "ℹ️ (leer)"
+    f = compute_signals_for_frame(df, cfg)
+    last, prev = f.iloc[-1], f.iloc[-2]
+
+    price_close = float(last["close"])
+    price_open  = float(last["open"])
+    ts = last["time"]
+
+    entry_cond = bool(last["entry_cond"])
+    exit_cond  = bool(last["exit_cond"])
+
+    pos = STATE.positions.get(sym, {"size":0,"avg":0.0,"entry_time":None})
+    size = pos["size"]; avg = pos["avg"]; entry_time = pos["entry_time"]
+
+    # stop/tp templates
+    def sl_from(p): return p*(1-cfg.slPerc/100.0)
+    def tp_from(p): return p*(1+cfg.tpPerc/100.0)
+
+    bars_in_trade=0
+    if entry_time is not None:
+        since = df[df["time"] >= pd.to_datetime(entry_time, utc=True)]
+        bars_in_trade = max(0, len(since)-1)
+
+    if size==0:
+        if entry_cond:
+            sl = sl_from(price_open); tp = tp_from(price_open)
+            qty = size_from_sizer(sym, price_open, sl)
+            return {"action":"buy","symbol":sym,"qty":qty,"px":price_open,"time":str(ts),
+                    "sl":sl,"tp":tp,"reason":"rule_entry",
+                    "rsi":float(last["rsi"]), "efi":float(last["efi"])}
+        return {"action":"none","symbol":sym,"reason":"flat_no_entry",
+                "rsi":float(last["rsi"]), "efi":float(last["efi"])}
+    else:
+        same_bar_ok = cfg.allowSameBarExit or (bars_in_trade>0)
+        cooldown_ok = (bars_in_trade>=cfg.minBarsInTrade)
+        rsi_exit_ok = exit_cond and same_bar_ok and cooldown_ok
+
+        cur_sl = sl_from(avg); cur_tp = tp_from(avg)
+        hit_sl = price_close <= cur_sl
+        hit_tp = price_close >= cur_tp
+
+        if rsi_exit_ok:
+            return {"action":"sell","symbol":sym,"qty":size,"px":price_open,"time":str(ts),"reason":"rsi_exit",
+                    "rsi":float(last["rsi"]), "efi":float(last["efi"])}
+        if hit_sl:
+            return {"action":"sell","symbol":sym,"qty":size,"px":cur_sl,"time":str(ts),"reason":"stop_loss",
+                    "rsi":float(last["rsi"]), "efi":float(last["efi"])}
+        if hit_tp:
+            return {"action":"sell","symbol":sym,"qty":size,"px":cur_tp,"time":str(ts),"reason":"take_profit",
+                    "rsi":float(last["rsi"]), "efi":float(last["efi"])}
+        return {"action":"none","symbol":sym,"reason":"hold",
+                "rsi":float(last["rsi"]), "efi":float(last["efi"])}
+
+# ============================ Trading (Alpaca) =========================
+def alpaca_trading_client():
     try:
-        await tg_app.bot.send_message(chat_id=chat_id, text=text)
+        from alpaca.trading.client import TradingClient
+        if not (APCA_API_KEY_ID and APCA_API_SECRET_KEY):
+            return None
+        return TradingClient(APCA_API_KEY_ID, APCA_API_SECRET_KEY, paper=True)
     except Exception as e:
-        print("send_text error:", e)
+        print("[alpaca] trading client error:", e); return None
 
-async def send_document_bytes(chat_id: str, data: bytes, filename: str, caption: str = ""):
-    if tg_app is None: return
-    try:
-        bio = io.BytesIO(data); bio.name = filename; bio.seek(0)
-        await tg_app.bot.send_document(chat_id=chat_id, document=InputFile(bio), caption=caption)
-    except Exception as e:
-        print("send_document error:", e)
-
-async def send_png(chat_id: str, fig, filename: str, caption: str = ""):
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight")
-    plt.close(fig)
-    await send_document_bytes(chat_id, buf.getvalue(), filename, caption)
-
-# ========= Trading via Alpaca (Paper) =========
 async def place_market_order(sym: str, qty: int, side: str, tif: str = "day") -> str:
     client = alpaca_trading_client()
     if client is None: return "alpaca client not available"
@@ -586,134 +606,73 @@ def alpaca_account() -> Dict[str,Any]:
     except Exception as e:
         print("alpaca_account error:", e); return {}
 
-# ========= Single-step logic =========
+# ============================ Runner ==================================
 def friendly_note(note: Dict[str,str]) -> str:
     prov = note.get("provider",""); det = note.get("detail","")
     if not prov: return ""
-    return f"📡 Daten: {prov} ({det})"
-
-def sl_for(p): return p*(1-CONFIG.slPerc/100.0)
-def tp_for(p): return p*(1+CONFIG.tpPerc/100.0)
-
-def bar_logic_last(df: pd.DataFrame, cfg: StratConfig, sym: str) -> Dict[str,Any]:
-    if df.empty or len(df) < max(cfg.rsiLen, cfg.efiLen) + 3:
-        return {"action":"none","reason":"not_enough_data","symbol":sym}
-
-    f = compute_signals_for_frame(df, cfg)
-    last = f.iloc[-1]
-
-    price_open  = float(last["open"])
-    price_close = float(last["close"])
-    bar_low     = float(last["low"])
-    bar_high    = float(last["high"])
-    ts = last["time"]
-
-    entry_cond = bool(last["entry_cond"])
-    exit_cond  = bool(last["exit_cond"])
-
-    pos = STATE.positions.get(sym, {"size":0,"avg":0.0,"entry_time":None})
-    size = pos["size"]; avg = pos["avg"]; entry_time = pos["entry_time"]
-
-    # bars in trade
-    bars_in_trade=0
-    if entry_time is not None:
-        since = df[df["time"] >= pd.to_datetime(entry_time, utc=True)]
-        bars_in_trade = max(0, len(since)-1)
-
-    if size==0:
-        if entry_cond:
-            # PDT Hard Stop: blocke neuen Daytrade ggf.
-            if pdt_block_new_daytrade():
-                return {"action":"none","symbol":sym,"reason":"pdt_block",
-                        "rsi":float(last["rsi"]), "efi":float(last["efi"])}
-            q = position_size_for_signal(sym, df)
-            return {"action":"buy","symbol":sym,"qty":q,"px":price_open,"time":str(ts),
-                    "sl":sl_for(price_open),"tp":tp_for(price_open),"reason":"rule_entry",
-                    "rsi":float(last["rsi"]), "efi":float(last["efi"])}
-        return {"action":"none","symbol":sym,"reason":"flat_no_entry",
-                "rsi":float(last["rsi"]), "efi":float(last["efi"])}
-
-    else:
-        same_bar_ok = cfg.allowSameBarExit or (bars_in_trade>0)
-        cooldown_ok = (bars_in_trade>=cfg.minBarsInTrade)
-        rsi_exit_ok = exit_cond and same_bar_ok and cooldown_ok
-
-        cur_sl = sl_for(avg); cur_tp = tp_for(avg)
-
-        if cfg.intrabar_risk_check:
-            hit_sl = bar_low  <= cur_sl
-            hit_tp = bar_high >= cur_tp
-        else:
-            hit_sl = price_close <= cur_sl
-            hit_tp = price_close >= cur_tp
-
-        if rsi_exit_ok:
-            return {"action":"sell","symbol":sym,"qty":size,"px":price_open,"time":str(ts),"reason":"rsi_exit",
-                    "rsi":float(last["rsi"]), "efi":float(last["efi"])}
-        if hit_sl:
-            return {"action":"sell","symbol":sym,"qty":size,"px":cur_sl,"time":str(ts),"reason":"stop_loss",
-                    "rsi":float(last["rsi"]), "efi":float(last["efi"])}
-        if hit_tp:
-            return {"action":"sell","symbol":sym,"qty":size,"px":cur_tp,"time":str(ts),"reason":"take_profit",
-                    "rsi":float(last["rsi"]), "efi":float(last["efi"])}
-        return {"action":"none","symbol":sym,"reason":"hold",
-                "rsi":float(last["rsi"]), "efi":float(last["efi"])}
+    if "Fallback" in prov or "Stooq" in prov or "CACHE" in prov:
+        return f"📡 Quelle: {prov} ({det})"
+    return f"📡 Quelle: {prov} ({det})"
 
 async def run_once_for_symbol(sym: str, send_signals: bool = True) -> Dict[str,Any]:
     df, note = fetch_ohlcv_tv_sync(sym, CONFIG.interval, CONFIG.lookback_days)
     if df.empty:
-        return {"ok":False, "msg": f"❌ Keine Daten für {sym}. {note}"}
+        # defensive: try cache for 1h
+        if CONFIG.interval.lower() in {"1h","60m"} and CONFIG.cache_intraday:
+            cached = cache_load_df(sym, "1h_tv")
+            if not cached.empty:
+                df = cached
+                note = {"provider":"CACHE (last 1h TV-sync)", "detail":"strict intraday"}
+            else:
+                return {"ok":False, "msg": f"❌ Keine Intraday-Daten & kein Cache für {sym}."}
+        else:
+            return {"ok":False, "msg": f"❌ Keine Daten für {sym}. {note}"}
 
     act = bar_logic_last(df, CONFIG, sym)
     STATE.last_status = f"{sym}: {act['action']} ({act['reason']})"
 
-    # Telegram Info
+    # Signals to Telegram
     if send_signals and CHAT_ID:
-        await send_text(CHAT_ID, f"ℹ️ {sym} {CONFIG.interval} rsi={act.get('rsi',np.nan):.2f} efi={act.get('efi',np.nan):.2f} • {act['reason']}")
-        await send_text(CHAT_ID, friendly_note(note))
+        await tg_send(f"ℹ️ {sym} {CONFIG.interval} rsi={act.get('rsi',np.nan):.2f} efi={act.get('efi',np.nan):.2f} • {act['reason']}")
+        note_msg = friendly_note(note)
+        if note_msg and ("Fallback" in note_msg or "CACHE" in note_msg or CONFIG.data_provider!="alpaca"):
+            await tg_send(note_msg)
 
-    # Trading (Paper) – blockiert automatisch bei PDT durch bar_logic_last
+    # PDT hard-block: block BUY entries if >=3 in last 5 biz days
+    if CONFIG.trade_enabled and act["action"]=="buy" and pdt_hard_block_active():
+        if CHAT_ID and send_signals:
+            await tg_send("⛔ PDT hard block aktiv (≥3 Daytrades/5 Tage). Kein neuer Entry.")
+        act["action"]="none"
+        act["reason"]="pdt_blocked"
+
+    # Execute paper order via Alpaca
     if CONFIG.trade_enabled and act["action"] in ("buy","sell"):
         if CONFIG.market_hours_only and not is_market_open_now():
-            if CHAT_ID:
-                await send_text(CHAT_ID, "⛔ Markt geschlossen – kein Trade.")
+            if CHAT_ID and send_signals:
+                await tg_send("⛔ Markt geschlossen – kein Trade ausgeführt.")
         else:
             side = "buy" if act["action"]=="buy" else "sell"
-            tif  = "day"
-            info = await place_market_order(sym, int(act["qty"]), side, tif)
-            if CHAT_ID:
-                await send_text(CHAT_ID, f"🛒 {side.upper()} {sym} x{act['qty']} @ {act['px']:.4f} • {info}")
+            info = await place_market_order(sym, int(act["qty"]), side, "day")
+            if CHAT_ID and send_signals:
+                await tg_send(f"🛒 {side.upper()} {sym} x{act['qty']} @ {act['px']:.4f} • {info}")
 
-    # Sim-Position + PDT-Registrierung
+    # Local sim position book (for status & PDT registration)
     pos = STATE.positions.get(sym, {"size":0, "avg":0.0, "entry_time":None})
     if act["action"]=="buy" and pos["size"]==0:
         STATE.positions[sym] = {"size":act["qty"],"avg":act["px"],"entry_time":act["time"]}
         if CHAT_ID and send_signals:
-            await send_text(CHAT_ID, f"🟢 LONG (sim) {sym} @ {act['px']:.4f} | SL={act.get('sl',np.nan):.4f} TP={act.get('tp',np.nan):.4f}")
+            await tg_send(f"🟢 LONG (sim) {sym} @ {act['px']:.4f} | SL={act.get('sl',np.nan):.4f} TP={act.get('tp',np.nan):.4f}")
     elif act["action"]=="sell" and pos["size"]>0:
         pnl = (act["px"] - pos["avg"]) / pos["avg"]
-        # PDT-Erkennung: Daytrade wenn open/close same US business day
-        try:
-            open_day  = pd.to_datetime(pos["entry_time"]).tz_convert("UTC").date()
-            close_day = pd.to_datetime(act["time"]).tz_convert("UTC").date()
-            if open_day == close_day and is_us_business_day(open_day):
-                register_daytrade(pd.to_datetime(pos["entry_time"]).to_pydatetime(), pd.to_datetime(act["time"]).to_pydatetime())
-        except Exception:
-            pass
+        # PDT detect (same day entry/exit)
+        pdt_register_if_daytrade(pos["entry_time"], act["time"])
         STATE.positions[sym] = {"size":0,"avg":0.0,"entry_time":None}
         if CHAT_ID and send_signals:
-            await send_text(CHAT_ID, f"🔴 EXIT (sim) {sym} @ {act['px']:.4f} • {act['reason']} • PnL={pnl*100:.2f}%")
+            await tg_send(f"🔴 EXIT (sim) {sym} @ {act['px']:.4f} • {act['reason']} • PnL={pnl*100:.2f}%")
 
     return {"ok":True,"act":act}
 
-# ========= Market open (UTC window) =========
-def is_market_open_now(dt_utc: Optional[datetime] = None) -> bool:
-    now = dt_utc or datetime.now(timezone.utc)
-    if not is_us_business_day(now.date()): return False
-    hhmm = now.hour*60 + now.minute
-    return (13*60+30) <= hhmm <= (20*60)
-
-# ========= Timer (synchron auf :30 für 1h) =========
+# ============================ Background Timer =========================
 TIMER = {
     "enabled": ENV_ENABLE_TIMER,
     "running": False,
@@ -724,70 +683,99 @@ TIMER = {
 }
 TIMER_TASK: Optional[asyncio.Task] = None
 
-def next_halfhour_anchor_utc(now: datetime) -> datetime:
-    base = now.replace(second=0, microsecond=0, tzinfo=timezone.utc)
-    mm = 30 if now.minute < 30 else 0
-    hour = now.hour if now.minute < 30 else (now.hour+1)
-    anchor = base.replace(minute=mm, hour=hour)
-    # für 1h TF laufen wir *auf* den Anchor
-    return anchor
+def next_half_hour_boundary_utc(now: Optional[datetime]=None) -> datetime:
+    now = now or datetime.now(timezone.utc)
+    nb = now.replace(second=0, microsecond=0)
+    if now.minute < 30:
+        nb = nb.replace(minute=30)
+    else:
+        nb = (nb + timedelta(hours=1)).replace(minute=30)
+    return nb
 
 async def timer_loop():
     TIMER["running"] = True
     try:
         while TIMER["enabled"]:
             now = datetime.now(timezone.utc)
-
-            # Market-hours Filter
-            if TIMER["market_hours_only"] and not is_market_open_now(now):
-                TIMER["next_due"] = None
-                await asyncio.sleep(30)
-                continue
-
-            # Candle-synced?
-            if CONFIG.timer_sync_to_candle and CONFIG.interval=="1h":
-                # Ziel: :30 UTC (13:30, 14:30, ...)
-                anchor = next_halfhour_anchor_utc(now)
-                # wenn jetzt genau Anchor? dann laufen — sonst schlafen bis Anchor
-                if abs((anchor - now).total_seconds()) > 2:
-                    sleep_s = max(1, (anchor - now).total_seconds())
-                    await asyncio.sleep(sleep_s)
-                    # nach Sleep sofort run
-            else:
-                # klassisch alle poll_minutes
-                if TIMER["last_run"] and TIMER["next_due"]:
-                    if now < pd.to_datetime(TIMER["next_due"]).to_pydatetime():
-                        await asyncio.sleep(5)
+            if CONFIG.interval.lower() in {"1h","60m"} and CONFIG.sync_half_hour:
+                # run at :30 boundaries
+                due = next_half_hour_boundary_utc(now)
+                # respect market hours
+                if TIMER["market_hours_only"]:
+                    # wait until boundary that is inside RTH; else sleep to next minute
+                    if not (13*60+30 <= due.hour*60+due.minute <= 20*60 and due.strftime("%Y-%m-%d") not in US_HOLIDAYS and due.weekday()<5):
+                        await asyncio.sleep(30)
                         continue
-
-            # run
-            for sym in CONFIG.symbols:
-                await run_once_for_symbol(sym, send_signals=True)
-            TIMER["last_run"] = now.isoformat()
-            if CONFIG.timer_sync_to_candle and CONFIG.interval=="1h":
-                # nächster Anchor + 1h
-                next_anchor = next_halfhour_anchor_utc(now + timedelta(minutes=61))
-                TIMER["next_due"] = next_anchor.isoformat()
+                wait_s = max(1, (due - now).total_seconds())
+                TIMER["next_due"] = due.isoformat()
+                await asyncio.sleep(wait_s)
+                # run
+                for sym in CONFIG.symbols:
+                    await run_once_for_symbol(sym, send_signals=True)
+                TIMER["last_run"] = datetime.now(timezone.utc).isoformat()
             else:
-                TIMER["next_due"] = (now + timedelta(minutes=TIMER["poll_minutes"])).isoformat()
-
-            await asyncio.sleep(2)
+                # generic poll_minutes cadence
+                if TIMER["market_hours_only"] and not is_market_open_now(now):
+                    TIMER["next_due"] = None
+                    await asyncio.sleep(60)
+                    continue
+                # due calc
+                if TIMER["last_run"] is None:
+                    for sym in CONFIG.symbols:
+                        await run_once_for_symbol(sym, send_signals=True)
+                    now = datetime.now(timezone.utc)
+                    TIMER["last_run"] = now.isoformat()
+                    TIMER["next_due"] = (now + timedelta(minutes=TIMER["poll_minutes"])).isoformat()
+                else:
+                    nxt = datetime.fromisoformat(TIMER["next_due"]) if TIMER["next_due"] else now
+                    if now >= nxt:
+                        for sym in CONFIG.symbols:
+                            await run_once_for_symbol(sym, send_signals=True)
+                        now = datetime.now(timezone.utc)
+                        TIMER["last_run"] = now.isoformat()
+                        TIMER["next_due"] = (now + timedelta(minutes=TIMER["poll_minutes"])).isoformat()
+                await asyncio.sleep(5)
     finally:
         TIMER["running"] = False
 
-# ========= Telegram Commands =========
+# ============================ Telegram Helpers =========================
+tg_app: Optional[Application] = None
+POLLING_STARTED = False
+
+async def tg_send(text: str):
+    if tg_app is None or CHAT_ID is None: return
+    try:
+        if not text.strip(): text="(leer)"
+        await tg_app.bot.send_message(chat_id=CHAT_ID, text=text)
+    except Exception as e:
+        print("tg_send error:", e)
+
+async def send_document_bytes(chat_id: str, data: bytes, filename: str, caption: str = ""):
+    if tg_app is None: return
+    try:
+        bio = io.BytesIO(data); bio.name = filename; bio.seek(0)
+        await tg_app.bot.send_document(chat_id=chat_id, document=InputFile(bio), caption=caption)
+    except Exception as e:
+        print("send_document error:", e)
+
+async def send_png(chat_id: str, fig, filename: str, caption: str = ""):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    await send_document_bytes(chat_id, buf.getvalue(), filename, caption)
+
+# ============================ Telegram Commands ========================
 async def cmd_start(update, context):
     global CHAT_ID
     CHAT_ID = str(update.effective_chat.id)
     await update.message.reply_text(
         "🤖 Bot verbunden.\n"
         "Befehle:\n"
-        "/status, /cfg, /set key=value …, /run, /live on|off, /bt [tage]\n"
-        "/sig, /ind, /plot, /dump [csv [N]], /dumpcsv [N]\n"
-        "/trade on|off, /pos, /account\n"
-        "/timer on|off, /timerstatus, /timerrunnow\n"
-        "/wf [is_days oos_days] – Walk-Forward/OOS\n"
-        "/pdt – Zähler letzte 5 Handelstage\n"
+        "/status, /cfg, /set key=value …, /run, /live on|off, /bt [tage], /wf [is oos]\n"
+        "/sig, /ind, /plot\n"
+        "/dump [csv [N]], /dumpcsv [N]\n"
+        "/trade on|off, /pos, /account, /pdt\n"
+        "/timer on|off, /timerstatus, /timerrunnow"
     )
 
 async def cmd_status(update, context):
@@ -795,19 +783,17 @@ async def cmd_status(update, context):
     for s,p in STATE.positions.items():
         pos_lines.append(f"{s}: size={p['size']} avg={p['avg']:.4f} since={p['entry_time']}")
     pos_txt = "\n".join(pos_lines) if pos_lines else "keine (sim)"
-
     await update.message.reply_text(
         "📊 Status\n"
         f"Symbols: {', '.join(CONFIG.symbols)}  TF={CONFIG.interval}\n"
-        f"Provider: {CONFIG.data_provider}  Feed: {STATE.data_feed}\n"
+        f"Provider: Alpaca data_feed={APCA_DATA_FEED}\n"
         f"Live: {'ON' if CONFIG.live_enabled else 'OFF'} • Timer: {'ON' if TIMER['enabled'] else 'OFF'} "
-        f"(alle {TIMER['poll_minutes']}m, market-hours-only={TIMER['market_hours_only']})\n"
-        f"RiskCheck: {'Intrabar (High/Low)' if CONFIG.intrabar_risk_check else 'EoB (Close)'}\n"
-        f"Sizer: mode={CONFIG.sizing_mode} value={CONFIG.sizing_value} max%={CONFIG.max_position_pct}\n"
+        f"(alle {TIMER['poll_minutes']}m, market-hours-only={TIMER['market_hours_only']}, sync_half_hour={CONFIG.sync_half_hour})\n"
+        f"Sizer: mode={CONFIG.sizing_mode} value={CONFIG.sizing_value} max_pos={CONFIG.max_position_pct}%\n"
+        f"PDT: last5biz={pdt_count_last5bizdays()} (hard_block={'ON' if pdt_hard_block_active() else 'OFF'})\n"
         f"LastStatus: {STATE.last_status}\n"
         f"Sim-Pos:\n{pos_txt}\n"
-        f"Trading: {'ON' if CONFIG.trade_enabled else 'OFF'} (Paper)\n"
-        f"PDT used (5BD): {pdt_count_last_5bd()}/{CONFIG.pdt_max_daytrades_5bd}"
+        f"Trading: {'ON' if CONFIG.trade_enabled else 'OFF'} (Paper)"
     )
 
 async def cmd_cfg(update, context):
@@ -824,7 +810,7 @@ def set_from_kv(kv: str) -> str:
     elif isinstance(cur, float):setattr(CONFIG, k, float(v))
     elif isinstance(cur, list): setattr(CONFIG, k, [x.strip() for x in v.split(",") if x.strip()])
     else:                       setattr(CONFIG, k, v)
-    # Sync Timer
+    # sync timer props
     if k=="poll_minutes": TIMER["poll_minutes"]=getattr(CONFIG,k)
     if k=="market_hours_only": TIMER["market_hours_only"]=getattr(CONFIG,k)
     return f"✓ {k} = {getattr(CONFIG,k)}"
@@ -835,10 +821,11 @@ async def cmd_set(update, context):
             "Nutze: /set key=value [key=value] …\n"
             "Beispiele:\n"
             "/set rsiLow=0 rsiHigh=68 rsiExit=48 sl=1 tp=4\n"
-            "/set interval=1h lookback_days=365 tv_anchor_halfhour=true\n"
-            "/set sizing_mode=percent_equity sizing_value=10 max_position_pct=50\n"
-            "/set intrabar_risk_check=true\n"
-            "/set pdt_hard_stop=true\n"
+            "/set interval=1h lookback_days=365\n"
+            "/set symbols=TQQQ,QQQ,SPY\n"
+            "/set data_provider=alpaca intraday_strict=true cache_intraday=true\n"
+            "/set sizing_mode=percent_equity sizing_value=25 max_position_pct=50\n"
+            "/set poll_minutes=10 market_hours_only=true sync_half_hour=true"
         ); return
     msgs=[]; errs=[]
     for a in context.args:
@@ -847,13 +834,6 @@ async def cmd_set(update, context):
         except Exception as e: errs.append(f"❌ {a}: {e}")
     txt = ("✅ Übernommen:\n" + "\n".join(msgs) + ("\n\n⚠️ Probleme:\n" + "\n".join(errs) if errs else "")).strip()
     await update.message.reply_text(txt)
-
-async def cmd_live(update, context):
-    if not context.args:
-        await update.message.reply_text("Nutze: /live on|off"); return
-    on = context.args[0].lower() in ("on","1","true","start")
-    CONFIG.live_enabled = on
-    await update.message.reply_text(f"Live = {'ON' if on else 'OFF'}")
 
 async def cmd_trade(update, context):
     if not context.args:
@@ -877,173 +857,30 @@ async def cmd_account(update, context):
     else:
         await update.message.reply_text("👤 Alpaca Account: kein Zugriff.")
 
+async def cmd_live(update, context):
+    if not context.args:
+        await update.message.reply_text("Nutze: /live on|off"); return
+    on = context.args[0].lower() in ("on","1","true","start")
+    CONFIG.live_enabled = on
+    await update.message.reply_text(f"Live = {'ON' if on else 'OFF'}")
+
 async def cmd_run(update, context):
     for sym in CONFIG.symbols:
         await run_once_for_symbol(sym, send_signals=True)
-
-async def cmd_bt(update, context):
-    days = 180
-    if context.args:
-        try: days = int(context.args[0])
-        except: pass
-    sym = CONFIG.symbols[0]
-    df, note = fetch_ohlcv_tv_sync(sym, CONFIG.interval, days)
-    if df.empty:
-        await update.message.reply_text(f"❌ Keine Daten für Backtest ({sym})."); return
-    f = compute_signals_for_frame(df, CONFIG)
-
-    pos=0; avg=0.0; eq=1.0; R=[]; entries=exits=0
-    for i in range(2,len(f)):
-        row, prev = f.iloc[i], f.iloc[i-1]
-        entry = bool(row["entry_cond"])
-        exitc = bool(row["exit_cond"])
-        if pos==0 and entry:
-            # PDT block im BT: simulativ (falls HardStop aktiv)
-            if CONFIG.pdt_hard_stop and pdt_count_last_5bd(pd.to_datetime(row["time"]).date()) >= CONFIG.pdt_max_daytrades_5bd:
-                continue
-            # sizing
-            px_open = float(row["open"])
-            q = position_size_for_signal(sym, f.iloc[:i+1])
-            pos=1; avg=px_open; entries+=1
-        elif pos==1:
-            sl = sl_for(avg); tp = tp_for(avg)
-            if CONFIG.intrabar_risk_check:
-                stop = float(row["low"])  <= sl
-                take = float(row["high"]) >= tp
-            else:
-                price = float(row["close"])
-                stop = price<=sl; take=price>=tp
-
-            if exitc or stop or take:
-                px = sl if stop else (tp if take else float(row["open"]))
-                # Slippage/Fees
-                slip = CONFIG.bt_slippage_bp/10000.0
-                fee  = CONFIG.bt_fee_perc/100.0
-                # long exit
-                gross_r = (px/avg) - 1.0
-                gross_r -= slip
-                gross_r -= fee
-                eq*= (1+gross_r); R.append(gross_r); exits+=1
-                pos=0; avg=0.0
-                # PDT-Registrierung (Backtest)
-                try:
-                    od = pd.to_datetime(prev["time"]).date()
-                    cd = pd.to_datetime(row["time"]).date()
-                    if od==cd and is_us_business_day(od):
-                        # temporär zählen (keine Datei-IO im BT)
-                        pass
-                except Exception:
-                    pass
-
-    if R:
-        a=np.array(R); win=(a>0).mean(); pf=a[a>0].sum()/(1e-9 + -a[a<0].sum() if (a<0).any() else 1e-9)
-        cagr=(eq**(365/max(1,days))-1)
-        await update.message.reply_text(
-            f"📈 Backtest {days}d  Trades={entries}/{exits}  Win={win*100:.1f}%  PF={pf:.2f}  CAGR~{cagr*100:.2f}%\n"
-            f"ℹ️ Hinweis: Slippage={CONFIG.bt_slippage_bp}bp, Fees={CONFIG.bt_fee_perc}%"
-        )
-    else:
-        await update.message.reply_text("📉 Backtest: keine abgeschlossenen Trades.")
-
-async def cmd_wf(update, context):
-    # Walk-Forward mit einfachem Grid auf rsiLow/rsiHigh/rsiExit
-    args = context.args or []
-    is_days = 120
-    oos_days = 30
-    if len(args)>=1:
-        try: is_days=int(args[0])
-        except: pass
-    if len(args)>=2:
-        try: oos_days=int(args[1])
-        except: pass
-    sym = CONFIG.symbols[0]
-    df_all, note = fetch_ohlcv_tv_sync(sym, CONFIG.interval, CONFIG.lookback_days)
-    if df_all.empty or len(df_all)<(is_days+oos_days+50):
-        await update.message.reply_text("❌ Zu wenige Daten für WF."); return
-
-    # Split rollierend
-    end_idx = len(df_all)
-    start_idx = 0
-    step = oos_days  # rollen um OOS-Fenster
-    results=[]
-    grid = []
-    for rl in [0, 5, 10]:
-        for rh in [60, 65, 68, 70]:
-            for rx in [45, 48, 50]:
-                if rl < rh:
-                    grid.append((rl, rh, rx))
-
-    def run_bt(df, rsiLow, rsiHigh, rsiExit):
-        cfg = CONFIG.copy()
-        cfg.rsiLow=rsiLow; cfg.rsiHigh=rsiHigh; cfg.rsiExit=rsiExit
-        f = compute_signals_for_frame(df, cfg)
-        pos=0; avg=0.0; eq=1.0; R=[]
-        for i in range(2,len(f)):
-            row, prev = f.iloc[i], f.iloc[i-1]
-            if pos==0 and bool(row["entry_cond"]):
-                if cfg.pdt_hard_stop and pdt_count_last_5bd(pd.to_datetime(row["time"]).date()) >= cfg.pdt_max_daytrades_5bd:
-                    continue
-                avg=float(row["open"]); pos=1
-            elif pos==1:
-                sl=sl_for(avg); tp=tp_for(avg)
-                if cfg.intrabar_risk_check:
-                    stop = float(row["low"])  <= sl
-                    take = float(row["high"]) >= tp
-                else:
-                    price = float(row["close"])
-                    stop = price<=sl; take=price>=tp
-                exitc = bool(row["exit_cond"])
-                if exitc or stop or take:
-                    px = sl if stop else (tp if take else float(row["open"]))
-                    slip = cfg.bt_slippage_bp/10000.0
-                    fee  = cfg.bt_fee_perc/100.0
-                    r=(px/avg-1)-slip-fee
-                    eq*=(1+r); R.append(r); pos=0; avg=0.0
-        if not R:
-            return 0.0
-        return np.prod(1+np.array(R))
-
-    for i in range(start_idx, end_idx - (is_days+oos_days), step):
-        is_df = df_all.iloc[i:i+is_days]
-        oos_df = df_all.iloc[i+is_days:i+is_days+oos_days]
-        if len(is_df)<20 or len(oos_df)<5: continue
-        # Suche bestes Grid auf IS
-        best=None; best_ret=-1
-        for rl,rh,rx in grid:
-            ret = run_bt(is_df, rl, rh, rx)
-            if ret>best_ret:
-                best_ret=ret; best=(rl,rh,rx)
-        # Test auf OOS
-        oos_ret = run_bt(oos_df, *best)
-        results.append({"win": oos_ret, "best": best})
-
-    if not results:
-        await update.message.reply_text("❌ WF: keine Fenster berechnet."); return
-
-    wins = [r["win"] for r in results]
-    geo = np.prod(wins) if wins else 0.0
-    await update.message.reply_text(
-        f"🧪 Walk-Forward (IS={is_days}d, OOS={oos_days}d)\n"
-        f"Fenster: {len(results)} | Geo.OOS-Faktor: {geo:.3f}\n"
-        f"Median OOS-Faktor: {np.median(wins):.3f}\n"
-        f"Grid: rsiLow∈{{0,5,10}}, rsiHigh∈{{60,65,68,70}}, rsiExit∈{{45,48,50}}"
-    )
 
 async def cmd_sig(update, context):
     sym = CONFIG.symbols[0]
     df, note = fetch_ohlcv_tv_sync(sym, CONFIG.interval, CONFIG.lookback_days)
     if df.empty:
         await update.message.reply_text("❌ Keine Daten."); return
-    f = compute_signals_for_frame(df, CONFIG)
-    last = f.iloc[-1]
-    txt = (
+    f = compute_signals_for_frame(df, CONFIG); last=f.iloc[-1]
+    await update.message.reply_text(
         f"🔎 {sym} {CONFIG.interval}\n"
         f"rsi={last['rsi']:.2f} (rise={bool(last['rsi_rising'])})  "
         f"efi={last['efi']:.2f} (rise={bool(last['efi_rising'])})\n"
         f"entry={bool(last['entry_cond'])}  exit={bool(last['exit_cond'])}\n"
         f"{friendly_note(note)}"
-    ).strip()
-    await update.message.reply_text(txt)
+    )
 
 async def cmd_ind(update, context):
     await cmd_sig(update, context)
@@ -1057,27 +894,17 @@ async def cmd_plot(update, context):
     f = compute_signals_for_frame(df, CONFIG).tail(n)
 
     fig, ax = plt.subplots(figsize=(10,6))
-    ax.plot(f.index, f["close"], label="Close")
-    ax.set_title(f"{sym} {CONFIG.interval} Close")
-    ax.grid(True); ax.legend(loc="best")
+    ax.plot(f.index, f["close"], label="Close"); ax.grid(True); ax.legend(); ax.set_title(f"{sym} {CONFIG.interval} Close")
     fig2, ax2 = plt.subplots(figsize=(10,3))
-    ax2.plot(f.index, f["rsi"], label="RSI")
-    ax2.axhline(CONFIG.rsiLow, linestyle="--")
-    ax2.axhline(CONFIG.rsiHigh, linestyle="--")
-    ax2.set_title("RSI (Wilder)"); ax2.grid(True); ax2.legend(loc="best")
+    ax2.plot(f.index, f["rsi"], label="RSI"); ax2.axhline(CONFIG.rsiLow, linestyle="--"); ax2.axhline(CONFIG.rsiHigh, linestyle="--")
+    ax2.grid(True); ax2.legend(); ax2.set_title("RSI (Wilder)")
     fig3, ax3 = plt.subplots(figsize=(10,3))
-    ax3.plot(f.index, f["efi"], label="EFI")
-    ax3.set_title("EFI (EMA(vol*Δclose))"); ax3.grid(True); ax3.legend(loc="best")
+    ax3.plot(f.index, f["efi"], label="EFI"); ax3.grid(True); ax3.legend(); ax3.set_title("EFI (EMA(vol*Δclose))")
 
     cid = str(update.effective_chat.id)
     await send_png(cid, fig,  f"{sym}_{CONFIG.interval}_close.png", "📈 Close")
     await send_png(cid, fig2, f"{sym}_{CONFIG.interval}_rsi.png",   "📈 RSI")
     await send_png(cid, fig3, f"{sym}_{CONFIG.interval}_efi.png",   "📈 EFI")
-
-def build_export_frame(df: pd.DataFrame, cfg: StratConfig) -> pd.DataFrame:
-    f = compute_signals_for_frame(df, cfg)
-    cols = ["open","high","low","close","volume","rsi","efi","rsi_rising","efi_rising","entry_cond","exit_cond","time"]
-    return f[cols]
 
 async def cmd_dump(update, context):
     sym = CONFIG.symbols[0]
@@ -1095,11 +922,10 @@ async def cmd_dump(update, context):
         csv_bytes = exp.to_csv(index=True).encode("utf-8")
         await send_document_bytes(str(update.effective_chat.id), csv_bytes,
                                   f"{sym}_{CONFIG.interval}_indicators_{n}.csv",
-                                  caption=f"🧾 CSV (OHLCV + RSI/EFI + Entry/Exit) {sym} {CONFIG.interval} n={n}")
+                                  caption=f"🧾 CSV (OHLCV + RSI/EFI + Flags) n={n}")
         return
 
-    f = compute_signals_for_frame(df, CONFIG)
-    last = f.iloc[-1]
+    f = compute_signals_for_frame(df, CONFIG); last = f.iloc[-1]
     payload = {
         "symbol": sym, "interval": CONFIG.interval, "provider": note.get("provider",""),
         "time": str(last["time"]),
@@ -1116,9 +942,135 @@ async def cmd_dumpcsv(update, context):
     context.args = ["csv"] + (context.args or [])
     await cmd_dump(update, context)
 
+async def cmd_bt(update, context):
+    days = 180
+    if context.args:
+        try: days = int(context.args[0])
+        except: pass
+    sym = CONFIG.symbols[0]
+    df, note = fetch_ohlcv_tv_sync(sym, CONFIG.interval, days)
+    if df.empty:
+        await update.message.reply_text(f"❌ Keine Daten für Backtest ({sym})."); return
+    f = compute_signals_for_frame(df, CONFIG)
+
+    eq=1.0; pos=0; avg=0.0; entry_ts=None
+    R=[]; entries=exits=0
+    slip = CONFIG.bt_slippage_bps/10000.0
+    fee  = CONFIG.bt_fee_per_trade
+
+    for i in range(2,len(f)):
+        row, prev = f.iloc[i], f.iloc[i-1]
+        entry = bool(row["entry_cond"]); exitc = bool(row["exit_cond"])
+        if pos==0 and entry:
+            # buy @ open + slippage
+            px = float(row["open"]) * (1+slip)
+            pos=1; avg=px; entry_ts=str(row["time"]); entries+=1
+            continue
+        if pos==1:
+            sl = avg*(1-CONFIG.slPerc/100); tp = avg*(1+CONFIG.tpPerc/100)
+            price = float(row["close"])
+            stop = price<=sl; take=price>=tp
+            if exitc or stop or take:
+                px = sl if stop else tp if take else float(row["open"])*(1-slip)  # sell: subtract slippage
+                r = (px-avg)/avg
+                eq *= (1+r)
+                eq -= fee/ max(1e-9, avg) * 0  # flat fee modeled outside return (optional, ignore for % eq)
+                R.append(r); exits+=1
+                # PDT register
+                pdt_register_if_daytrade(entry_ts, str(row["time"]))
+                pos=0; avg=0.0; entry_ts=None
+
+    if R:
+        a=np.array(R); win=(a>0).mean(); pf=a[a>0].sum()/(1e-9 + -a[a<0].sum() if (a<0).any() else 1e-9)
+        cagr=(eq**(365/max(1,days))-1)
+        await update.message.reply_text(
+            f"📈 Backtest {days}d  Trades={entries}/{exits}  Win={win*100:.1f}%  PF={pf:.2f}  CAGR~{cagr*100:.2f}%\n"
+            f"ℹ️ Hinweis: Slippage={CONFIG.bt_slippage_bps} bps, Fees={CONFIG.bt_fee_per_trade:.2f}, EoB-Logik."
+        )
+    else:
+        await update.message.reply_text("📉 Backtest: keine abgeschlossenen Trades.")
+
+async def cmd_wf(update, context):
+    # Walk-Forward: /wf 120 30
+    is_days, oos_days = 120, 30
+    if context.args and len(context.args)>=2:
+        try:
+            is_days = int(context.args[0]); oos_days = int(context.args[1])
+        except: pass
+    sym = CONFIG.symbols[0]
+    df, note = fetch_ohlcv_tv_sync(sym, CONFIG.interval, CONFIG.lookback_days)
+    if df.empty:
+        await update.message.reply_text("❌ Keine Daten."); return
+    f = compute_signals_for_frame(df, CONFIG)
+
+    def bt_on_slice(ff: pd.DataFrame, cfg: StratConfig) -> float:
+        eq=1.0; pos=0; avg=0.0
+        slip = cfg.bt_slippage_bps/10000.0
+        for i in range(2,len(ff)):
+            row, prev = ff.iloc[i], ff.iloc[i-1]
+            entry = bool(row["entry_cond"]); exitc = bool(row["exit_cond"])
+            if pos==0 and entry:
+                avg=float(row["open"])*(1+slip); pos=1; continue
+            if pos==1:
+                sl = avg*(1-cfg.slPerc/100); tp = avg*(1+cfg.tpPerc/100)
+                price=float(row["close"])
+                if price<=sl or price>=tp or exitc:
+                    px = sl if price<=sl else tp if price>=tp else float(row["open"])*(1-slip)
+                    eq *= (1+(px-avg)/avg); pos=0; avg=0.0
+        return eq
+
+    # crude grid over rsiLow/high/exit
+    lows  = [0, 30, 40, 50]
+    highs = [60, 65, 68, 70]
+    exits = [40, 45, 48, 50]
+    best=None; best_eq=-1
+
+    # rolling window walk-forward
+    total_oos_eq=1.0; slices=0
+    for end in pd.date_range(f.index.min()+timedelta(days=is_days+oos_days),
+                             f.index.max(), freq=f"{oos_days}D"):
+        IS = f.loc[end - timedelta(days=is_days+oos_days): end - timedelta(days=oos_days)]
+        OOS= f.loc[end - timedelta(days=oos_days): end]
+        if len(IS)<50 or len(OOS)<10: continue
+
+        # search best on IS
+        local_best=None; local_best_eq=-1
+        for lo in lows:
+            for hi in highs:
+                if hi <= lo: continue
+                for ex in exits:
+                    cfg = CONFIG.copy()
+                    cfg.rsiLow = lo; cfg.rsiHigh=hi; cfg.rsiExit=ex
+                    eq_is = bt_on_slice(IS, cfg)
+                    if eq_is > local_best_eq:
+                        local_best_eq=eq_is; local_best=(lo,hi,ex)
+        if local_best is None: continue
+
+        lo,hi,ex = local_best
+        cfg = CONFIG.copy()
+        cfg.rsiLow=lo; cfg.rsiHigh=hi; cfg.rsiExit=ex
+        eq_oos = bt_on_slice(OOS, cfg)
+        total_oos_eq *= eq_oos
+        slices += 1
+
+    if slices>0:
+        cagr = (total_oos_eq**(365/max(1, is_days+oos_days))-1)
+        await update.message.reply_text(
+            f"🧪 Walk-Forward (IS={is_days}d, OOS={oos_days}d) Slices={slices}\n"
+            f"OOS EQ Multiplier={total_oos_eq:.3f}  ~CAGR={cagr*100:.2f}%"
+        )
+    else:
+        await update.message.reply_text("⚠️ WF: nicht genug Datenfenster.")
+
 async def cmd_pdt(update, context):
-    cnt = pdt_count_last_5bd()
-    await update.message.reply_text(f"📛 PDT: Daytrades in letzten 5 Handelstagen: {cnt}/{CONFIG.pdt_max_daytrades_5bd} • HardStop={'ON' if CONFIG.pdt_hard_stop else 'OFF'}")
+    await update.message.reply_text(
+        "📛 PDT\n" +
+        json.dumps({
+            "last5biz_trades": pdt_count_last5bizdays(),
+            "hard_block": pdt_hard_block_active(),
+            "persist": PDT_JSON
+        }, indent=2)
+    )
 
 async def cmd_timer(update, context):
     if not context.args:
@@ -1142,8 +1094,8 @@ async def cmd_timerrunnow(update, context):
         await run_once_for_symbol(sym, send_signals=True)
     now = datetime.now(timezone.utc)
     TIMER["last_run"] = now.isoformat()
-    if CONFIG.timer_sync_to_candle and CONFIG.interval=="1h":
-        TIMER["next_due"] = next_halfhour_anchor_utc(now + timedelta(minutes=61)).isoformat()
+    if CONFIG.interval.lower() in {"1h","60m"} and CONFIG.sync_half_hour:
+        TIMER["next_due"] = next_half_hour_boundary_utc(now).isoformat()
     else:
         TIMER["next_due"] = (now + timedelta(minutes=TIMER["poll_minutes"])).isoformat()
     await update.message.reply_text("⏱️ Timer-Run ausgeführt.")
@@ -1151,14 +1103,13 @@ async def cmd_timerrunnow(update, context):
 async def on_message(update, context):
     await update.message.reply_text("Unbekannter Befehl. /start für Hilfe")
 
-# ========= FastAPI lifespan (PTB polling & timer) =========
+# ============================ FastAPI Lifespan =========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global tg_app, POLLING_STARTED, TIMER_TASK
     try:
         tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-        # Handlers
+        # handlers
         tg_app.add_handler(CommandHandler("start",   cmd_start))
         tg_app.add_handler(CommandHandler("status",  cmd_status))
         tg_app.add_handler(CommandHandler("cfg",     cmd_cfg))
@@ -1166,6 +1117,7 @@ async def lifespan(app: FastAPI):
         tg_app.add_handler(CommandHandler("run",     cmd_run))
         tg_app.add_handler(CommandHandler("live",    cmd_live))
         tg_app.add_handler(CommandHandler("bt",      cmd_bt))
+        tg_app.add_handler(CommandHandler("wf",      cmd_wf))
         tg_app.add_handler(CommandHandler("sig",     cmd_sig))
         tg_app.add_handler(CommandHandler("ind",     cmd_ind))
         tg_app.add_handler(CommandHandler("plot",    cmd_plot))
@@ -1174,11 +1126,10 @@ async def lifespan(app: FastAPI):
         tg_app.add_handler(CommandHandler("trade",   cmd_trade))
         tg_app.add_handler(CommandHandler("pos",     cmd_pos))
         tg_app.add_handler(CommandHandler("account", cmd_account))
+        tg_app.add_handler(CommandHandler("pdt",     cmd_pdt))
         tg_app.add_handler(CommandHandler("timer",        cmd_timer))
         tg_app.add_handler(CommandHandler("timerstatus",  cmd_timerstatus))
         tg_app.add_handler(CommandHandler("timerrunnow",  cmd_timerrunnow))
-        tg_app.add_handler(CommandHandler("wf",           cmd_wf))
-        tg_app.add_handler(CommandHandler("pdt",          cmd_pdt))
         tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
         await tg_app.initialize()
@@ -1197,12 +1148,11 @@ async def lifespan(app: FastAPI):
                     print("✅ Telegram polling läuft")
                     break
                 except Conflict as e:
-                    print(f"⚠️ Conflict: {e}. retry in {delay}s")
-                    await asyncio.sleep(delay); delay=min(delay*2,60)
+                    print(f"⚠️ Conflict: {e}. retry {delay}s"); await asyncio.sleep(delay); delay=min(delay*2,60)
                 except Exception:
                     traceback.print_exc(); await asyncio.sleep(10)
 
-        # Timer ggf. starten
+        # start timer
         if TIMER["enabled"] and TIMER_TASK is None:
             TIMER_TASK = asyncio.create_task(timer_loop())
             print("⏱️ Timer gestartet")
@@ -1228,16 +1178,13 @@ async def lifespan(app: FastAPI):
             pass
         try:
             if tg_app:
-                await tg_app.stop()
-                await tg_app.shutdown()
+                await tg_app.stop(); await tg_app.shutdown()
         except Exception:
             pass
-        POLLING_STARTED=False
-        TIMER["running"]=False
         print("🛑 Shutdown complete")
 
-# ========= FastAPI app & routes =========
-app = FastAPI(title="TQQQ Strategy + Telegram (V5) TV-sync/PDT/Sizer", lifespan=lifespan)
+# ============================ FastAPI App & Routes =====================
+app = FastAPI(title="TQQQ Strategy + Telegram (V5.1)", lifespan=lifespan)
 
 @app.get("/")
 async def root():
@@ -1245,8 +1192,7 @@ async def root():
         "ok": True,
         "symbols": CONFIG.symbols,
         "interval": CONFIG.interval,
-        "provider": CONFIG.data_provider,
-        "feed": STATE.data_feed,
+        "provider": f"alpaca ({APCA_DATA_FEED})",
         "live": CONFIG.live_enabled,
         "timer": {
             "enabled": TIMER["enabled"],
@@ -1263,8 +1209,8 @@ async def tick():
         await run_once_for_symbol(sym, send_signals=False)
     now = datetime.now(timezone.utc)
     TIMER["last_run"]=now.isoformat()
-    if CONFIG.timer_sync_to_candle and CONFIG.interval=="1h":
-        TIMER["next_due"] = next_halfhour_anchor_utc(now + timedelta(minutes=61)).isoformat()
+    if CONFIG.interval.lower() in {"1h","60m"} and CONFIG.sync_half_hour:
+        TIMER["next_due"]=next_half_hour_boundary_utc(now).isoformat()
     else:
         TIMER["next_due"]=(now + timedelta(minutes=TIMER["poll_minutes"])).isoformat()
     return {"ran": True, "at": TIMER["last_run"]}
@@ -1292,3 +1238,4 @@ def tgstatus():
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
     return Response(status_code=204)
+# ============================ END FILE ============================
