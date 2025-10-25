@@ -936,33 +936,35 @@ def next_half_hour_utc(now: datetime) -> datetime:
     return nxt
 
 async def timer_loop():
-    TIMER["running"]=True
+    TIMER["running"] = True
     try:
         while TIMER["enabled"]:
-            now = tz_utc_now()
+            now = datetime.now(timezone.utc)
 
-            # RTH gate if enabled
-            if TIMER["market_hours_only"] and not is_market_open_rth(now):
-                # schlaf bis nächste Minute
-                TIMER["next_due"] = None
-                await asyncio.sleep(30)
-                continue
-
-            # Set next_due if not set
-            if TIMER["next_due"] is None:
-                TIMER["next_due"] = next_half_hour_utc(now).isoformat()
-
-            due_dt = datetime.fromisoformat(TIMER["next_due"])
-            if now >= due_dt:
-                # run once per symbol
+            # ✅ Falls Timer neu gestartet wurde oder kein next_due: sofort eine Runde laufen
+            if TIMER["last_run"] is None or TIMER["next_due"] is None:
                 for sym in CONFIG.symbols:
                     await run_once_for_symbol(sym, send_signals=True)
                 TIMER["last_run"] = now.isoformat()
-                TIMER["next_due"] = next_half_hour_utc(now + timedelta(seconds=1)).isoformat()
+                TIMER["next_due"] = (now + timedelta(minutes=TIMER["poll_minutes"])).isoformat()
+                await asyncio.sleep(5)
+                continue
 
-            await asyncio.sleep(5)
+            # ✅ Market hours filter – ABER erst nachdem ein Run existiert!
+            if TIMER["market_hours_only"] and not is_market_open_now():
+                await asyncio.sleep(30)
+                continue
+
+            next_due_dt = datetime.fromisoformat(TIMER["next_due"])
+            if now >= next_due_dt:
+                for sym in CONFIG.symbols:
+                    await run_once_for_symbol(sym, send_signals=True)
+                TIMER["last_run"] = now.isoformat()
+                TIMER["next_due"] = (now + timedelta(minutes=TIMER["poll_minutes"])).isoformat()
+
+            await asyncio.sleep(10)
     finally:
-        TIMER["running"]=False
+        TIMER["running"] = False
 
 def start_timer_task():
     global TIMER_TASK
