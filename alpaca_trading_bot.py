@@ -941,28 +941,39 @@ async def timer_loop():
         while TIMER["enabled"]:
             now = datetime.now(timezone.utc)
 
-            # ✅ Falls Timer neu gestartet wurde oder kein next_due: sofort eine Runde laufen
-            if TIMER["last_run"] is None or TIMER["next_due"] is None:
+            # Initialisierung: wenn noch nie gelaufen oder next_due fehlt → sofort 1x laufen, dann next_due setzen
+            if TIMER.get("last_run") is None or TIMER.get("next_due") is None:
                 for sym in CONFIG.symbols:
                     await run_once_for_symbol(sym, send_signals=True)
                 TIMER["last_run"] = now.isoformat()
-                TIMER["next_due"] = (now + timedelta(minutes=TIMER["poll_minutes"])).isoformat()
+                TIMER["next_due"] = _align_next_due(now).isoformat()
                 await asyncio.sleep(5)
                 continue
 
-            # ✅ Market hours filter – ABER erst nachdem ein Run existiert!
-            if TIMER["market_hours_only"] and not is_market_open_now():
+            # Market Hours Filter: NICHT vor Initialisierung anwenden
+            if TIMER.get("market_hours_only", False) and not is_market_open_now():
+                # Schlafen, aber next_due nicht löschen – beim nächsten Open wird geprüft
                 await asyncio.sleep(30)
                 continue
 
-            next_due_dt = datetime.fromisoformat(TIMER["next_due"])
-            if now >= next_due_dt:
+            # Fälligkeit prüfen
+            try:
+                due_dt = datetime.fromisoformat(TIMER["next_due"])
+            except Exception:
+                # Falls korrupt → neu setzen
+                due_dt = _align_next_due(now)
+                TIMER["next_due"] = due_dt.isoformat()
+
+            if now >= due_dt:
+                # Run ausführen
                 for sym in CONFIG.symbols:
                     await run_once_for_symbol(sym, send_signals=True)
+                now = datetime.now(timezone.utc)
                 TIMER["last_run"] = now.isoformat()
-                TIMER["next_due"] = (now + timedelta(minutes=TIMER["poll_minutes"])).isoformat()
+                TIMER["next_due"] = _align_next_due(now).isoformat()
 
-            await asyncio.sleep(10)
+            await asyncio.sleep(5)
+
     finally:
         TIMER["running"] = False
 
@@ -970,6 +981,58 @@ def start_timer_task():
     global TIMER_TASK
     if TIMER_TASK is None or TIMER_TASK.done():
         TIMER_TASK = asyncio.create_task(timer_loop())
+
+from datetime import datetime, timedelta, timezone
+
+def _align_next_due(now_utc: datetime) -> datetime:
+    """
+    Liefert das nächste Fälligkeitsdatum:
+    - 1h-Intervall: immer zur vollen halben Stunde (:30) in UTC (TV-konform)
+    - 15m/5m: analog auf Candle-Grenzen ausrichtbar (hier Fokus 1h)
+
+    Berücksichtigt Market Hours:
+      - Wenn RTH-only und gerade Closed => auf den nächsten RTH-Slot ausrichten.
+    """
+    interval = CONFIG.interval.lower()
+    rth_only = TIMER.get("market_hours_only", False)
+
+    def next_rth_anchor(base: datetime) -> datetime:
+        # RTH grob (13:30–20:00 UTC), nächste :30 finden
+        d = base
+        # springe falls vor 13:30 auf 13:30; falls nach 20:00 auf nächsten Tag 13:30
+        hhmm = d.hour * 60 + d.minute
+        if hhmm < 13*60 + 30:
+            d = d.replace(hour=13, minute=30, second=0, microsecond=0)
+        elif hhmm >= 20*60:
+            d = (d + timedelta(days=1)).replace(hour=13, minute=30, second=0, microsecond=0)
+        # auf nächste :30 runden
+        if d.minute < 30:
+            d = d.replace(minute=30, second=0, microsecond=0)
+        else:
+            # nächste volle Stunde :30
+            d = (d + timedelta(hours=1)).replace(minute=30, second=0, microsecond=0)
+        # Sa/So → auf Montag 13:30
+        while d.weekday() >= 5:
+            d = (d + timedelta(days=1)).replace(hour=13, minute=30, second=0, microsecond=0)
+        return d
+
+    # 1) Intervall-spezifisch ausrichten
+    if interval in ("1h", "60m"):
+        # nächster :30-Anker
+        base = now_utc
+        if now_utc.minute < 30:
+            due = now_utc.replace(minute=30, second=0, microsecond=0)
+        else:
+            due = (now_utc + timedelta(hours=1)).replace(minute=30, second=0, microsecond=0)
+    else:
+        # generischer Fallback: jetzt + poll_minutes
+        due = now_utc + timedelta(minutes=TIMER["poll_minutes"])
+
+    # 2) Market Hours berücksichtigen
+    if rth_only and not is_market_open_now(due):
+        due = next_rth_anchor(due)
+
+    return due
 
 # ========= FASTAPI LIFESPAN =========
 @asynccontextmanager
