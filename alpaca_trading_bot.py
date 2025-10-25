@@ -42,7 +42,10 @@ ENV_POLL_MINUTES      = int(os.getenv("POLL_MINUTES", "60"))
 ENV_MARKET_HOURS_ONLY = os.getenv("MARKET_HOURS_ONLY", "true").lower() in ("1","true","on","yes")
 
 # Persistence paths
-DATA_DIR = pathlib.Path("/mnt/data")
+from pathlib import Path
+
+DATA_DIR = Path("./data")  # Render-kompatibel
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 PDT_JSON = DATA_DIR / "pdt_trades.json"
 
