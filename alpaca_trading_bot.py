@@ -48,7 +48,9 @@ def ensure_writable_dir(preferred: str, fallback: str = "./data") -> Path:
             continue
     return Path("./")
 
-DATA_DIR = ensure_writable_dir("/mnt/data", "./data")
+
+DATA_DIR = Path(os.getenv("DATA_DIR", "/tmp/appdata"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 PDT_FILE = DATA_DIR / "pdt_trades.json"
 
 # ========= Helpers / Time =========
@@ -1003,21 +1005,39 @@ async def cmd_timerrunnow(update, context):
 async def on_msg(update, context):
     await update.message.reply_text("Unbekannter Befehl. /start für Hilfe")
 
+async def cmd_debugbars(update, context):
+    import pandas as pd
+    sym = CONFIG.symbols[0]
+    df, note = fetch_ohlcv_with_note(sym, CONFIG.interval, CONFIG.lookback_days)
+    if df.empty:
+        await update.message.reply_text("❌ Keine Daten."); 
+        return
+    tail = df.tail(6)
+    lines = [
+        f"{pd.to_datetime(r['time']).strftime('%Y-%m-%d %H:%M:%S %Z')} | close={r['close']:.4f}"
+        for _, r in tail.iterrows()
+    ]
+    await update.message.reply_text(
+        "🧪 Debug Bars (last 6)\n" + "\n".join(lines) +
+        "\n(1h sollte auf :30 UTC enden, z. B. 13:30, 14:30 …)"
+    )
+
 # ========= FastAPI lifespan =========
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global tg_app, POLLING_STARTED, TIMER_TASK
+    # --- Startup ---
     try:
-        load_pdt()
-
         tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+        # Handlers registrieren (inkl. debugbars)
         tg_app.add_handler(CommandHandler("start",   cmd_start))
         tg_app.add_handler(CommandHandler("status",  cmd_status))
         tg_app.add_handler(CommandHandler("cfg",     cmd_cfg))
         tg_app.add_handler(CommandHandler("set",     cmd_set))
         tg_app.add_handler(CommandHandler("run",     cmd_run))
+        tg_app.add_handler(CommandHandler("live",    cmd_live))
         tg_app.add_handler(CommandHandler("bt",      cmd_bt))
-        tg_app.add_handler(CommandHandler("wf",      cmd_wf))
         tg_app.add_handler(CommandHandler("sig",     cmd_sig))
         tg_app.add_handler(CommandHandler("ind",     cmd_ind))
         tg_app.add_handler(CommandHandler("plot",    cmd_plot))
@@ -1029,57 +1049,69 @@ async def lifespan(app: FastAPI):
         tg_app.add_handler(CommandHandler("timer",        cmd_timer))
         tg_app.add_handler(CommandHandler("timerstatus",  cmd_timerstatus))
         tg_app.add_handler(CommandHandler("timerrunnow",  cmd_timerrunnow))
-        tg_app.add_handler(CommandHandler("market",       cmd_market))
-        tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_msg))
-tg_app.add_handler(CommandHandler("debugbars", cmd_debugbars))
+        tg_app.add_handler(CommandHandler("debugbars",    cmd_debugbars))
+        tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
         await tg_app.initialize()
         await tg_app.start()
+
+        # Webhook entfernen (wir nutzen Polling)
         try:
             await tg_app.bot.delete_webhook(drop_pending_updates=True)
-        except Exception:
-            pass
+        except Exception as e:
+            print("delete_webhook warn:", e)
 
+        # Polling nur einmal starten (mit Conflict-Retry)
         if not POLLING_STARTED:
-            delay=5
+            delay = 5
             while True:
                 try:
                     await tg_app.updater.start_polling(poll_interval=1.0, timeout=10.0)
-                    POLLING_STARTED=True
+                    POLLING_STARTED = True
                     print("✅ Telegram polling läuft")
                     break
                 except Conflict as e:
-                    print(f"⚠️ Conflict: {e}. retry {delay}s")
-                    await asyncio.sleep(delay); delay=min(delay*2,60)
+                    print(f"⚠️ Conflict: {e}. retry in {delay}s")
+                    await asyncio.sleep(delay)
+                    delay = min(delay*2, 60)
                 except Exception:
-                    traceback.print_exc(); await asyncio.sleep(10)
+                    traceback.print_exc()
+                    await asyncio.sleep(10)
 
-        if TIMER["enabled"] and TIMER_TASK is None:
+        # Timer ggf. starten
+        if TIMER.get("enabled") and TIMER_TASK is None:
             TIMER_TASK = asyncio.create_task(timer_loop())
             print("⏱️ Timer gestartet")
 
     except Exception as e:
-        print("Startup error:", e); traceback.print_exc()
+        print("❌ Telegram startup error:", e)
+        traceback.print_exc()
 
+    # --- Serve ---
     try:
         yield
     finally:
+        # --- Shutdown ---
         try:
             if TIMER_TASK:
-                TIMER["enabled"]=False
-                await asyncio.sleep(0.1)
+                TIMER["enabled"] = False
+                await asyncio.sleep(0.05)
                 TIMER_TASK.cancel()
-        except: pass
+        except Exception:
+            pass
         try:
             if tg_app and tg_app.updater:
                 await tg_app.updater.stop()
-        except: pass
+        except Exception:
+            pass
         try:
             if tg_app:
-                await tg_app.stop(); await tg_app.shutdown()
-        except: pass
-        POLLING_STARTED=False
-        TIMER["running"]=False
+                await tg_app.stop()
+                await tg_app.shutdown()
+        except Exception:
+            pass
+        POLLING_STARTED = False
+        TIMER["running"] = False
         print("🛑 Shutdown complete")
 
 # ========= FastAPI =========
