@@ -1052,6 +1052,13 @@ async def cmd_live(update, context):
         msg.append(f"⚠️ Timer-Fehler: {e}")
     await update.message.reply_text(" • ".join(msg))
     
+# --- Fallback-Message-Handler (muss VOR lifespan definiert sein) ---
+async def on_message(update, context):
+    try:
+        await update.message.reply_text("Unbekannter Befehl. Tippe /start für Hilfe.")
+    except Exception as e:
+        # Log nur zur Sicherheit, damit der Bot nicht crasht
+        print("on_message error:", e)
 # ========= FastAPI lifespan =========
 @asynccontextmanager
 async def lifespan(app: FastAPI):
