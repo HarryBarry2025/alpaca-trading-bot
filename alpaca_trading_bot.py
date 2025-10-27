@@ -4,7 +4,6 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from typing import Optional, Dict, Any, Tuple, List
-
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -53,6 +52,70 @@ DATA_DIR = ensure_writable_dir("/mnt/data", "./data")
 PDT_FILE = DATA_DIR / "pdt_trades.json"
 
 # ========= Helpers / Time =========
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def next_half_hour_utc(dt: datetime) -> datetime:
+    # anchor at :30; if before :30 → same hour :30, otherwise next hour :30
+    base = dt.replace(second=0, microsecond=0)
+    if base.minute < 30:
+        return base.replace(minute=30)
+    return (base + timedelta(hours=1)).replace(minute=30)
+
+def build_tv_1h_from_1m(df_1m: pd.DataFrame, rth_only: bool = True) -> pd.DataFrame:
+    """
+    Convert 1-minute bars to TV-like 1h bars:
+    - Bars close at :30 UTC (9:30 ET open → 13:30 UTC)
+    - Drop the last incomplete hour
+    - Optionally restrict to RTH (Mo–Fr, 13:30–20:00 UTC closes)
+    """
+    if df_1m is None or df_1m.empty:
+        return pd.DataFrame()
+
+    m = df_1m.copy()
+    m = m.sort_index()
+
+    # ensure datetime index is UTC
+    if not isinstance(m.index, pd.DatetimeIndex):
+        m.index = pd.to_datetime(m.index, utc=True)
+    elif m.index.tz is None:
+        m.index = m.index.tz_localize("UTC")
+    else:
+        m.index = m.index.tz_convert("UTC")
+
+    # shift -30 min to make 1H bins close exactly on :30
+    m.index = m.index - pd.Timedelta(minutes=30)
+
+    # resample to 1H, right-closed/right-labeled
+    h = m.resample("1H", label="right", closed="right").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    )
+
+    # shift index back to true close times (on :30)
+    h.index = h.index + pd.Timedelta(minutes=30)
+
+    # drop last incomplete bar: only keep bars <= last completed :30
+    end = now_utc()
+    last_complete_close = next_half_hour_utc(end) - timedelta(hours=1)
+    h = h[h.index <= last_complete_close]
+
+    # optional: RTH only (Mon–Fri, 13:30–20:00 UTC)
+    if rth_only and not h.empty:
+        hhmm = h.index.hour * 60 + h.index.minute
+        mask = (
+            (h.index.weekday < 5) &
+            (hhmm >= (13*60 + 30)) &
+            (hhmm <= (20*60))  # bar close 20:00 UTC
+        )
+        h = h[mask]
+
+    if h.empty:
+        return h
+
+    h["time"] = h.index
+    return h
+
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -163,6 +226,23 @@ def efi_tv(close: pd.Series, vol: pd.Series, length: int) -> pd.Series:
     return ema(raw, length)
 
 # ========= Alpaca Data =========
+def fetch_ohlcv_with_note(symbol: str, interval: str, lookback_days: int):
+    interval = interval.lower()
+    if interval in ("1h","60m"):
+        # Pull fresh 1m and resample to TV-style 1h
+        m = fetch_alpaca_1m(symbol, lookback_minutes=lookback_days*24*60 // 3)  # e.g., ~1/3 of minutes
+        if not m.empty:
+            h = build_tv_1h_from_1m(m, rth_only=CONFIG.market_hours_only)
+            if not h.empty:
+                return h, {"provider": f"Alpaca ({os.getenv('APCA_DATA_FEED','sip')})", "detail": "1m→1h TV-sync"}
+        # fallbacks (Yahoo/Stooq) if needed...
+        # ...
+    else:
+        # your existing “direct 1d” path
+        # ...
+        pass
+
+
 def alpaca_data_client():
     try:
         from alpaca.data.historical import StockHistoricalDataClient
@@ -171,34 +251,47 @@ def alpaca_data_client():
         print("[alpaca] data client error:", e)
         return None
 
-def fetch_alpaca_1m(symbol: str, days: int, feed: str) -> pd.DataFrame:
-    client = alpaca_data_client()
-    if client is None: return pd.DataFrame()
+def fetch_alpaca_1m(symbol: str, lookback_minutes: int = 4000) -> pd.DataFrame:
     try:
+        from alpaca.data.historical import StockHistoricalDataClient
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-        end = now_utc()
-        start = end - timedelta(days=max(days, 5))
+    except Exception as e:
+        print("[alpaca] 1m library not available:", e)
+        return pd.DataFrame()
+
+    if not (APCA_API_KEY_ID and APCA_API_SECRET_KEY):
+        print("[alpaca] missing API key/secret")
+        return pd.DataFrame()
+
+    client = StockHistoricalDataClient(APCA_API_KEY_ID, APCA_API_SECRET_KEY)
+
+    end = now_utc()
+    start = end - timedelta(minutes=lookback_minutes)
+    tf = TimeFrame(1, TimeFrameUnit.Minute)
+
+    feed = os.getenv("APCA_DATA_FEED", "sip").lower()  # 'sip' if you have Algo+; else 'iex'
+    try:
         req = StockBarsRequest(
             symbol_or_symbols=symbol,
-            timeframe=TimeFrame(1, TimeFrameUnit.Minute),
+            timeframe=tf,
             start=start,
             end=end,
             feed=feed,
-            limit=50000
+            limit=100000
         )
         bars = client.get_stock_bars(req)
         if not bars or bars.df is None or bars.df.empty:
+            print("[alpaca] 1m empty frame")
             return pd.DataFrame()
         df = bars.df.copy()
         if isinstance(df.index, pd.MultiIndex):
-            try: df = df.xs(symbol, level=0)
-            except Exception: pass
+            df = df.xs(symbol, level=0)
+        df = df.rename(columns=str.lower).sort_index()
         if not isinstance(df.index, pd.DatetimeIndex):
-            df.index = pd.to_datetime(df.index)
-        df.index = df.index.tz_convert("UTC") if df.index.tz is not None else df.index.tz_localize("UTC")
-        df = df.sort_index()
-        df = df.rename(columns=str.lower)
+            df.index = pd.to_datetime(df.index, utc=True)
+        else:
+            df.index = df.index.tz_convert("UTC")
         df["time"] = df.index
         return df[["open","high","low","close","volume","time"]]
     except Exception as e:
@@ -584,37 +677,55 @@ def compute_next_due(now: datetime) -> datetime:
 async def timer_loop():
     TIMER["running"] = True
     try:
-        now = now_utc()
-        if not TIMER.get("next_due"):
-            TIMER["next_due"] = to_iso(compute_next_due(now))
         while TIMER["enabled"]:
-            await asyncio.sleep(1)
             now = now_utc()
-            nd = TIMER.get("next_due")
-            if not nd:
-                TIMER["next_due"] = to_iso(compute_next_due(now))
+
+            # Market-hours gate (optional)
+            if TIMER["market_hours_only"] and not is_market_open_now(now):
+                await asyncio.sleep(15)
                 continue
-            try:
-                next_due_dt = datetime.fromisoformat(nd)
-            except Exception:
-                TIMER["next_due"] = to_iso(compute_next_due(now))
-                continue
-            if now >= next_due_dt:
-                # Market-hours gate only affects RUN permission, not scheduling
-                if (not TIMER["market_hours_only"]) or in_rth_utc(now):
-                    for sym in CONFIG.symbols:
-                        try:
-                            await run_once_for_symbol(sym, send_signals=True)
-                        except Exception as e:
-                            print("timer run error:", e)
-                    TIMER["last_run"] = to_iso(now)
-                TIMER["next_due"] = to_iso(compute_next_due(now))
+
+            # Compute next_due
+            if CONFIG.interval.lower() in ("1h", "60m"):
+                if TIMER["next_due"] is None:
+                    TIMER["next_due"] = next_half_hour_utc(now).isoformat()
+                due_dt = datetime.fromisoformat(TIMER["next_due"])
+            else:
+                if TIMER["next_due"] is None:
+                    TIMER["next_due"] = (now + timedelta(minutes=TIMER["poll_minutes"])).isoformat()
+                due_dt = datetime.fromisoformat(TIMER["next_due"])
+
+            if now >= due_dt:
+                for sym in CONFIG.symbols:
+                    await run_once_for_symbol(sym, send_signals=True)
+                TIMER["last_run"] = now.isoformat()
+                if CONFIG.interval.lower() in ("1h","60m"):
+                    TIMER["next_due"] = next_half_hour_utc(now + timedelta(seconds=1)).isoformat()
+                else:
+                    TIMER["next_due"] = (now + timedelta(minutes=TIMER["poll_minutes"])).isoformat()
+
+            await asyncio.sleep(5)
     finally:
         TIMER["running"] = False
 
 TIMER_TASK: Optional[asyncio.Task] = None
 
 # ========= Telegram Commands =========
+
+async def cmd_debugbars(update, context):
+    sym = CONFIG.symbols[0]
+    df, note = fetch_ohlcv_with_note(sym, CONFIG.interval, CONFIG.lookback_days)
+    if df.empty:
+        await update.message.reply_text("❌ Keine Daten."); return
+    tail = df.tail(6)
+    lines = [f"{pd.to_datetime(r['time']).strftime('%Y-%m-%d %H:%M:%S %Z')} | close={r['close']:.4f}"
+             for _, r in tail.iterrows()]
+    await update.message.reply_text(
+        "🧪 Debug Bars (last 6)\n" + "\n".join(lines) +
+        "\n(Barzeiten = Abschlusszeiten; für 1h sollten sie auf :30 UTC enden.)"
+    )
+
+
 async def cmd_start(update, context):
     global CHAT_ID
     CHAT_ID = str(update.effective_chat.id)
@@ -920,6 +1031,7 @@ async def lifespan(app: FastAPI):
         tg_app.add_handler(CommandHandler("timerrunnow",  cmd_timerrunnow))
         tg_app.add_handler(CommandHandler("market",       cmd_market))
         tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_msg))
+tg_app.add_handler(CommandHandler("debugbars", cmd_debugbars))
 
         await tg_app.initialize()
         await tg_app.start()
