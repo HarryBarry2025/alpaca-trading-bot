@@ -1021,7 +1021,37 @@ async def cmd_debugbars(update, context):
         "🧪 Debug Bars (last 6)\n" + "\n".join(lines) +
         "\n(1h sollte auf :30 UTC enden, z. B. 13:30, 14:30 …)"
     )
-
+# --- LIVE toggle + Timer-Kopplung (optional) ---
+async def cmd_live(update, context):
+    """
+    /live on|off
+    Setzt CONFIG.live_enabled und startet/stoppt den Timer analog zu /timer.
+    """
+    global TIMER_TASK
+    if not context.args:
+        await update.message.reply_text("Nutze: /live on|off")
+        return
+    on = context.args[0].lower() in ("on", "1", "true", "start")
+    CONFIG.live_enabled = on
+    # Timer spiegeln
+    TIMER["enabled"] = on
+    msg = [f"Live = {'ON' if on else 'OFF'}"]
+    try:
+        if on:
+            if TIMER_TASK is None or TIMER_TASK.done():
+                TIMER_TASK = asyncio.create_task(timer_loop())
+                msg.append("⏱️ Timer gestartet")
+        else:
+            if TIMER_TASK and not TIMER_TASK.done():
+                TIMER["enabled"] = False
+                await asyncio.sleep(0.05)
+                TIMER_TASK.cancel()
+                TIMER_TASK = None
+                msg.append("⏱️ Timer gestoppt")
+    except Exception as e:
+        msg.append(f"⚠️ Timer-Fehler: {e}")
+    await update.message.reply_text(" • ".join(msg))
+    
 # ========= FastAPI lifespan =========
 @asynccontextmanager
 async def lifespan(app: FastAPI):
